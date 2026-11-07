@@ -1,0 +1,2849 @@
+"""LLM gateway: route OpenAI-shaped requests through LiteLLM using OpenRAG config."""
+
+import json
+import math
+from types import SimpleNamespace
+
+import pytest
+
+from config.config_manager import (
+    AnthropicConfig,
+    GenericProviderConfig,
+    OllamaConfig,
+    OpenAIConfig,
+    ProvidersConfig,
+    WatsonXConfig,
+)
+from services.llm_gateway import (
+    LlmContextLengthError,
+    LlmGatewayError,
+    chat_completions,
+    embeddings,
+    provider_credentials,
+    resolve_call,
+    split_model_id,
+)
+
+
+def _config(**overrides):
+    providers = SimpleNamespace(
+        openai=SimpleNamespace(api_key="sk-openai", configured=True),
+        anthropic=SimpleNamespace(api_key="sk-ant", configured=True),
+        ollama=SimpleNamespace(
+            endpoint="http://localhost:11434", resolved_endpoint="", configured=True
+        ),
+        watsonx=SimpleNamespace(
+            api_key="wx-key",
+            endpoint="https://us-south.ml.cloud.ibm.com",
+            project_id="proj",
+            configured=True,
+        ),
+    )
+    agent = SimpleNamespace(llm_model="gpt-4o-mini", llm_provider="openai")
+    knowledge = SimpleNamespace(
+        embedding_model="text-embedding-3-small", embedding_provider="openai"
+    )
+    cfg = SimpleNamespace(providers=providers, agent=agent, knowledge=knowledge)
+    for key, value in overrides.items():
+        setattr(cfg, key, value)
+    return cfg
+
+
+def test_split_model_id_recognises_known_prefixes():
+    assert split_model_id("anthropic/claude-sonnet-4-5") == ("anthropic", "claude-sonnet-4-5")
+    assert split_model_id("gpt-4o-mini") == (None, "gpt-4o-mini")
+    assert split_model_id("openai/gpt-4o") == ("openai", "gpt-4o")
+
+
+def test_resolve_call_uses_configured_provider_when_model_is_bare():
+    model, provider, creds = resolve_call("gpt-4o-mini", kind="chat", config=_config())
+    assert provider == "openai"
+    assert model == "gpt-4o-mini"
+    assert creds["api_key"] == "sk-openai"
+
+
+def test_resolve_call_anthropic_gets_litellm_prefix():
+    cfg = _config(agent=SimpleNamespace(llm_model="claude-sonnet-4-5", llm_provider="anthropic"))
+    model, provider, creds = resolve_call(None, kind="chat", config=cfg)
+    assert provider == "anthropic"
+    assert model == "anthropic/claude-sonnet-4-5"
+    assert creds["api_key"] == "sk-ant"
+
+
+def test_resolve_call_watsonx_includes_project_and_endpoint():
+    cfg = _config(
+        knowledge=SimpleNamespace(embedding_model="ibm/slate", embedding_provider="watsonx")
+    )
+    model, provider, creds = resolve_call("ibm/slate", kind="embedding", config=cfg)
+    assert provider == "watsonx"
+    assert model == "watsonx/ibm/slate"
+    assert creds["project_id"] == "proj"
+    assert creds["api_base"] == "https://us-south.ml.cloud.ibm.com"
+
+
+def test_legacy_text_embedding_3_small_routes_to_openai_not_selected_provider():
+    cfg = _config(
+        knowledge=SimpleNamespace(
+            embedding_model="azure-deployment",
+            embedding_provider="azure",
+            legacy_embedding_provider_map={},
+        )
+    )
+
+    model, provider, creds = resolve_call(
+        "legacy:text-embedding-3-small", kind="embedding", config=cfg
+    )
+
+    assert provider == "openai"
+    assert model == "text-embedding-3-small"
+    assert creds["api_key"] == "sk-openai"
+
+
+def test_operator_mapping_routes_other_legacy_embedding_models():
+    cfg = _config()
+    cfg.knowledge.legacy_embedding_provider_map = {"ibm/slate-125m": "watsonx"}
+
+    model, provider, creds = resolve_call("legacy:ibm/slate-125m", kind="embedding", config=cfg)
+
+    assert provider == "watsonx"
+    assert model == "watsonx/ibm/slate-125m"
+    assert creds["project_id"] == "proj"
+
+
+def test_unmapped_legacy_model_does_not_fall_back_to_selected_provider():
+    cfg = _config(
+        knowledge=SimpleNamespace(
+            embedding_model="azure-deployment",
+            embedding_provider="azure",
+            legacy_embedding_provider_map={},
+        )
+    )
+
+    with pytest.raises(LlmGatewayError) as exc:
+        resolve_call("legacy:ibm/slate-125m", kind="embedding", config=cfg)
+
+    assert "has no provider mapping" in exc.value.message
+    assert "legacy_embedding_provider_map" in exc.value.message
+
+
+def test_indexed_space_with_removed_provider_does_not_fall_back_to_selected_provider():
+    cfg = _config()
+
+    with pytest.raises(LlmGatewayError) as exc:
+        resolve_call("space:removed:model-a", kind="embedding", config=cfg)
+
+    assert "removed" in exc.value.message
+    assert "not configured" in exc.value.message
+
+
+def test_provider_credentials_rejects_unknown_provider():
+    with pytest.raises(LlmGatewayError) as exc:
+        provider_credentials("gemini", _config())
+    assert exc.value.status_code == 400
+    assert "gemini" in exc.value.message
+
+
+def test_provider_credentials_rejects_missing_openai_key():
+    cfg = _config()
+    cfg.providers.openai.api_key = ""
+    with pytest.raises(LlmGatewayError) as exc:
+        provider_credentials("openai", cfg)
+    assert "not configured" in exc.value.message
+
+
+def test_provider_credentials_supports_arbitrary_litellm_provider():
+    providers = ProvidersConfig(
+        openai=OpenAIConfig(),
+        anthropic=AnthropicConfig(),
+        watsonx=WatsonXConfig(),
+        ollama=OllamaConfig(),
+        custom={
+            "gemini": GenericProviderConfig(
+                credentials={
+                    "api_key": "gemini-secret",
+                    "vertex_project": "project-1",
+                },
+                configured=True,
+            )
+        },
+    )
+    cfg = SimpleNamespace(providers=providers)
+
+    assert provider_credentials("gemini", cfg) == {
+        "api_key": "gemini-secret",
+        "vertex_project": "project-1",
+    }
+
+
+def test_indexed_space_routes_through_its_configured_generic_provider():
+    providers = ProvidersConfig(
+        openai=OpenAIConfig(),
+        anthropic=AnthropicConfig(),
+        watsonx=WatsonXConfig(),
+        ollama=OllamaConfig(),
+        custom={
+            "gemini": GenericProviderConfig(
+                credentials={"api_key": "gemini-secret"},
+                configured=True,
+            )
+        },
+    )
+    cfg = SimpleNamespace(providers=providers)
+
+    model, provider, credentials = resolve_call(
+        "space:gemini:text-embedding-004", kind="embedding", config=cfg
+    )
+
+    assert model == "gemini/text-embedding-004"
+    assert provider == "gemini"
+    assert credentials == {"api_key": "gemini-secret"}
+
+
+def test_onprem_resolved_credentials_remain_json_serializable():
+    providers = ProvidersConfig(
+        openai=OpenAIConfig(),
+        anthropic=AnthropicConfig(),
+        watsonx=WatsonXConfig(),
+        ollama=OllamaConfig(),
+        custom={
+            "watsonx_onprem": GenericProviderConfig(
+                credentials={
+                    "api_base": "https://cpd.example.com",
+                    "username": "cpduser",
+                    "api_key": "secret",
+                    "ssl_verify": "false",
+                },
+                configured=True,
+            )
+        },
+    )
+    cfg = SimpleNamespace(providers=providers)
+
+    _, provider, credentials = resolve_call(
+        "watsonx_onprem:test-model",
+        kind="chat",
+        config=cfg,
+    )
+
+    assert provider == "watsonx_onprem"
+    assert "client" not in credentials
+    json.dumps(credentials)
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_calls_litellm_with_config_key(monkeypatch):
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return {
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+        }
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    result = await chat_completions(
+        {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]},
+        config=_config(),
+    )
+    assert result["choices"][0]["message"]["content"] == "hi"
+    assert captured["model"] == "gpt-4o-mini"
+    assert captured["api_key"] == "sk-openai"
+    assert captured["messages"][0]["content"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_forwards_tools(monkeypatch):
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return {"id": "chatcmpl-1", "choices": []}
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    tools = [{"type": "function", "function": {"name": "search"}}]
+    await chat_completions(
+        {
+            "model": "anthropic/claude-sonnet-4-5",
+            "messages": [],
+            "tools": tools,
+            "tool_choice": "auto",
+        },
+        config=_config(),
+    )
+    assert captured["tools"] == tools
+    assert captured["tool_choice"] == "auto"
+    assert captured["model"] == "anthropic/claude-sonnet-4-5"
+    assert captured["api_key"] == "sk-ant"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_stream_emits_sse(monkeypatch):
+    class _Chunk:
+        def model_dump_json(self):
+            return '{"choices":[{"delta":{"content":"hi"}}]}'
+
+    async def fake_stream():
+        yield _Chunk()
+
+    async def fake_acompletion(**kwargs):
+        assert kwargs["stream"] is True
+        return fake_stream()
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    stream = await chat_completions(
+        {"model": "gpt-4o-mini", "messages": [], "stream": True},
+        config=_config(),
+    )
+    lines = [line async for line in stream]
+    assert lines[0].startswith("data: {")
+    assert lines[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_redacts_api_key_on_failure(monkeypatch):
+    async def boom(**kwargs):
+        raise RuntimeError("upstream rejected sk-openai")
+
+    monkeypatch.setattr("litellm.acompletion", boom)
+    with pytest.raises(LlmGatewayError) as exc:
+        await chat_completions({"model": "gpt-4o-mini", "messages": []}, config=_config())
+    assert exc.value.status_code == 502
+    # The key never appears anywhere, and the log-only detail keeps the marker.
+    assert "sk-openai" not in exc.value.message
+    assert "sk-openai" not in exc.value.detail
+    assert "[redacted]" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_keeps_upstream_internals_out_of_client_message(monkeypatch):
+    """CodeQL py/stack-trace-exposure: upstream exception text is log-only."""
+
+    async def boom(**kwargs):
+        raise RuntimeError("Traceback /srv/app/litellm/router.py line 42: connect to 10.0.0.5")
+
+    monkeypatch.setattr("litellm.acompletion", boom)
+    with pytest.raises(LlmGatewayError) as exc:
+        await chat_completions({"model": "gpt-4o-mini", "messages": []}, config=_config())
+
+    assert exc.value.status_code == 502
+    # A RuntimeError from our own code is not the provider's to explain, so the
+    # message collapses to the fixed literal — only the failing call is named.
+    assert exc.value.message.startswith(
+        "The model provider could not be reached. Please try again."
+    )
+    assert "openai/gpt-4o-mini" in exc.value.message
+    for leak in ("RuntimeError", "Traceback", "/srv/app", "10.0.0.5"):
+        assert leak not in exc.value.message
+    # Operators still get the full picture in logs.
+    assert "RuntimeError" in exc.value.detail
+    assert "10.0.0.5" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_keeps_credential_errors_actionable(monkeypatch):
+    """A bad key must stay diagnosable in onboarding, not collapse to the generic text."""
+
+    async def boom(**kwargs):
+        raise RuntimeError("Incorrect API key provided")
+
+    monkeypatch.setattr("litellm.acompletion", boom)
+    with pytest.raises(LlmGatewayError) as exc:
+        await chat_completions({"model": "gpt-4o-mini", "messages": []}, config=_config())
+
+    assert exc.value.status_code == 502
+    assert "api key" in exc.value.message.lower()
+    # Classified, not forwarded: the client message is a fixed literal.
+    assert "Incorrect API key provided" not in exc.value.message
+    assert "Incorrect API key provided" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_embeddings_keeps_upstream_internals_out_of_client_message(monkeypatch):
+    async def boom(**kwargs):
+        raise RuntimeError("Traceback /srv/app/litellm/router.py: connect to 10.0.0.5")
+
+    monkeypatch.setattr("litellm.aembedding", boom)
+    with pytest.raises(LlmGatewayError) as exc:
+        await embeddings({"model": "text-embedding-3-small", "input": ["hi"]}, config=_config())
+
+    assert exc.value.status_code == 502
+    assert exc.value.message.startswith(
+        "The model provider could not be reached. Please try again."
+    )
+    for leak in ("RuntimeError", "Traceback", "/srv/app", "10.0.0.5"):
+        assert leak not in exc.value.message
+    assert "10.0.0.5" in exc.value.detail
+
+
+def test_gateway_error_detail_defaults_to_message():
+    """Authored 4xx messages are already safe, so detail mirrors them."""
+    exc = LlmGatewayError("model is required", 400)
+    assert exc.detail == exc.message
+
+
+@pytest.mark.asyncio
+async def test_embeddings_calls_litellm(monkeypatch):
+    captured = {}
+
+    async def fake_aembedding(**kwargs):
+        captured.update(kwargs)
+        return {"object": "list", "data": [{"embedding": [0.1], "index": 0}]}
+
+    monkeypatch.setattr("litellm.aembedding", fake_aembedding)
+    result = await embeddings(
+        {"model": "text-embedding-3-small", "input": ["hello"]},
+        config=_config(),
+    )
+    assert result["data"][0]["embedding"] == [0.1]
+    assert captured["api_key"] == "sk-openai"
+    assert captured["input"] == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_onprem_embeddings_batch_large_document_inputs(monkeypatch):
+    providers = ProvidersConfig(
+        openai=OpenAIConfig(),
+        anthropic=AnthropicConfig(),
+        watsonx=WatsonXConfig(),
+        ollama=OllamaConfig(),
+        custom={
+            "watsonx_onprem": GenericProviderConfig(
+                credentials={
+                    "api_base": "https://cpd.example.com",
+                    "username": "cpduser",
+                    "api_key": "secret",
+                },
+                configured=True,
+            )
+        },
+    )
+    calls: list[list[str]] = []
+
+    async def fake_aembedding(**kwargs):
+        batch = kwargs["input"]
+        calls.append(batch)
+        return {
+            "object": "list",
+            "data": [
+                {"object": "embedding", "embedding": [float(index)], "index": index}
+                for index in range(len(batch))
+            ],
+            "usage": {
+                "prompt_tokens": len(batch),
+                "total_tokens": len(batch),
+            },
+        }
+
+    monkeypatch.setattr("litellm.aembedding", fake_aembedding)
+    monkeypatch.setattr(
+        "services.llm_gateway._provider_runtime_kwargs",
+        lambda provider, config: {},
+    )
+
+    result = await embeddings(
+        {
+            "model": "watsonx_onprem:ibm/slate-30m-english-rtrvr",
+            "input": [f"chunk-{index}" for index in range(70)],
+        },
+        config=SimpleNamespace(providers=providers),
+    )
+
+    assert [len(batch) for batch in calls] == [32, 32, 6]
+    assert [item["index"] for item in result["data"]] == list(range(70))
+    assert result["usage"] == {"prompt_tokens": 70, "total_tokens": 70}
+
+
+class _RecordingLogger:
+    """structlog-style logger that records calls instead of emitting them."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str, dict]] = []
+
+    def _record(self, level):
+        def log(event, **kwargs):
+            self.calls.append((level, event, kwargs))
+
+        return log
+
+    def __getattr__(self, name):
+        return self._record(name)
+
+
+def test_log_completion_shape_flags_an_empty_completion(monkeypatch):
+    """An empty completion must be visible in logs, not silently returned.
+
+    Langflow's agent ends its loop on an empty completion and the user just
+    sees "The server didn't return a response", with nothing upstream to
+    explain it.
+    """
+    from services import llm_gateway
+
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(llm_gateway, "logger", recorder)
+
+    payload = {"choices": [{"finish_reason": "stop", "message": {"content": "", "tool_calls": []}}]}
+    llm_gateway._log_completion_shape(payload, "watsonx", "watsonx/ibm/granite-4-h-small")
+
+    assert recorder.calls, "nothing was logged"
+    level, event, fields = recorder.calls[0]
+    assert level == "warning"
+    assert "no content and no tool calls" in event
+    assert fields["provider"] == "watsonx"
+    assert fields["tool_calls"] == 0
+    assert fields["content_chars"] == 0
+
+
+def test_log_completion_shape_reports_a_normal_completion(monkeypatch):
+    from services import llm_gateway
+
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(llm_gateway, "logger", recorder)
+
+    payload = {
+        "choices": [
+            {"finish_reason": "stop", "message": {"content": "secret answer", "tool_calls": []}}
+        ]
+    }
+    llm_gateway._log_completion_shape(payload, "openai", "gpt-4o-mini")
+
+    level, _event, fields = recorder.calls[0]
+    assert level == "info"
+    assert fields["content_chars"] == len("secret answer")
+    # Metadata only — message content must never reach the logs.
+    assert "secret answer" not in str(recorder.calls)
+
+
+def test_log_completion_shape_survives_an_unexpected_payload():
+    from services import llm_gateway
+
+    # Must never raise: diagnostics run on the response path.
+    llm_gateway._log_completion_shape({"choices": "not-a-list"}, "openai", "gpt-4o-mini")
+    llm_gateway._log_completion_shape({}, "openai", "gpt-4o-mini")
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_still_forwards_every_chunk_and_terminates():
+    """Diagnostics must not disturb the stream itself."""
+    from services import llm_gateway
+
+    chunks = [
+        {"choices": [{"delta": {"content": "he"}}]},
+        {"choices": [{"delta": {"content": "llo"}, "finish_reason": "stop"}]},
+    ]
+
+    async def gen():
+        for chunk in chunks:
+            yield chunk
+
+    out = [line async for line in llm_gateway._stream_sse(gen(), "openai", "gpt-4o-mini")]
+
+    assert out[-1] == "data: [DONE]\n\n"
+    assert len(out) == len(chunks) + 1
+    assert '"content": "he"' in out[0] or '"content":"he"' in out[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_warns_when_a_stream_yields_nothing_usable(monkeypatch):
+    """The watsonx symptom: 200 OK, chunks arrive, but no content and no tool calls."""
+    from services import llm_gateway
+
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(llm_gateway, "logger", recorder)
+
+    async def gen():
+        yield {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+
+    [
+        line
+        async for line in llm_gateway._stream_sse(gen(), "watsonx", "watsonx/ibm/granite-4-h-small")
+    ]
+
+    levels = [call[0] for call in recorder.calls]
+    assert "warning" in levels
+    _level, event, fields = next(c for c in recorder.calls if c[0] == "warning")
+    assert "no content and no tool calls" in event
+    assert fields["provider"] == "watsonx"
+    assert fields["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_counts_tool_calls_as_usable_output(monkeypatch):
+    from services import llm_gateway
+
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(llm_gateway, "logger", recorder)
+
+    async def gen():
+        yield {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "search_documents", "arguments": "{}"},
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+
+    [line async for line in llm_gateway._stream_sse(gen(), "openai", "gpt-4o-mini")]
+
+    level, event, fields = recorder.calls[0]
+    assert level == "info"
+    assert fields["tool_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_lets_litellm_drop_provider_unsupported_params(monkeypatch):
+    """A multi-provider proxy must degrade, not 502, on provider param gaps.
+
+    OpenAI-compatible clients send OpenAI's full parameter set, but watsonx
+    rejects `parallel_tool_calls`, `max_completion_tokens` and `logit_bias`,
+    and LiteLLM raises UnsupportedParamsError rather than ignoring them.
+    """
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return {"id": "1", "choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    await chat_completions(
+        {
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "parallel_tool_calls": True,
+            "max_completion_tokens": 64,
+        },
+        config=_config(),
+    )
+
+    assert captured["drop_params"] is True
+    # The params are still forwarded — LiteLLM decides per provider what to keep.
+    assert captured["parallel_tool_calls"] is True
+    assert captured["max_completion_tokens"] == 64
+
+
+def test_watsonx_rejects_params_we_forward_unless_they_are_dropped():
+    """Pin the upstream behaviour this fix relies on.
+
+    If LiteLLM ever starts accepting these for watsonx, `drop_params` becomes
+    redundant rather than wrong — but while it rejects them, forwarding them
+    without the flag is a hard failure for every watsonx caller.
+    """
+    from litellm.exceptions import UnsupportedParamsError
+    from litellm.utils import get_optional_params
+
+    for param, value in (
+        ("parallel_tool_calls", True),
+        ("max_completion_tokens", 64),
+        ("logit_bias", {"1": 1}),
+    ):
+        with pytest.raises(UnsupportedParamsError):
+            get_optional_params(
+                model="ibm/granite-4-h-small",
+                custom_llm_provider="watsonx",
+                **{param: value},
+            )
+
+        dropped = get_optional_params(
+            model="ibm/granite-4-h-small",
+            custom_llm_provider="watsonx",
+            drop_params=True,
+            **{param: value},
+        )
+        assert param not in dropped
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        # Canonical tag. The name keeps its own slashes and colons.
+        ("watsonx:openai/gpt-oss-120b", ("watsonx", "openai/gpt-oss-120b")),
+        ("watsonx:ibm/granite-4-h-small", ("watsonx", "ibm/granite-4-h-small")),
+        ("ollama:gpt-oss:120b-cloud", ("ollama", "gpt-oss:120b-cloud")),
+        ("openai:ft:gpt-4-0613", ("openai", "ft:gpt-4-0613")),
+        # Legacy `provider/model` tags still resolve.
+        ("watsonx/ibm/granite-4-h-small", ("watsonx", "ibm/granite-4-h-small")),
+        ("anthropic/claude-sonnet-4-5", ("anthropic", "claude-sonnet-4-5")),
+        # Untagged ids are left to the configured default provider.
+        ("gpt-4o-mini", (None, "gpt-4o-mini")),
+        ("gpt-oss:120b-cloud", (None, "gpt-oss:120b-cloud")),
+        ("ft:gpt-4-0613", (None, "ft:gpt-4-0613")),
+    ],
+)
+def test_split_model_id_handles_tagged_and_untagged_ids(model_id, expected):
+    from services.llm_gateway import split_model_id
+
+    assert split_model_id(model_id) == expected
+
+
+def test_a_vendor_qualified_name_is_not_mistaken_for_a_provider_tag():
+    """watsonx serves `openai/gpt-oss-120b`; the `openai/` is part of the name.
+
+    Splitting on the slash routed it to OpenAI as a bare `gpt-oss-120b`, which
+    LiteLLM rejects with "LLM Provider NOT provided", surfacing to the user as
+    "The model provider could not be reached."
+
+    Whether the id names one owner or several depends on the deployment's
+    provider config — a cluster row that also lists it makes two — so what is
+    asserted here is the part that must hold either way: the id is never handed
+    to the provider its prefix happens to name.
+    """
+    from services.llm_gateway import split_model_id
+    from services.model_catalog import catalog_owners
+
+    provider, name = split_model_id("openai/gpt-oss-120b")
+
+    assert name == "openai/gpt-oss-120b"
+    owners = catalog_owners("openai/gpt-oss-120b")
+    if len(owners) == 1:
+        assert provider == owners[0]
+    else:
+        # Untagged; `resolve_call` picks between the owners with the config in
+        # hand. Either way it is not "openai".
+        assert provider is None
+
+
+def test_model_ids_served_by_v1_models_round_trip():
+    """Every id `/v1/models` publishes must resolve back to its owner."""
+    from services.llm_gateway import split_model_id
+    from services.model_catalog import openai_models_list
+
+    for row in openai_models_list()["data"]:
+        provider, _name = split_model_id(row["id"])
+        if row["owned_by"] == "openai":
+            continue
+        assert provider == row["owned_by"], row
+
+
+def test_no_catalogue_id_has_a_provider_shaped_prefix_before_a_colon():
+    """The property that makes `:` a safe separator.
+
+    If a future model id breaks this, `provider:model` becomes ambiguous the
+    same way `provider/model` already is.
+    """
+    from services.model_catalog import PROVIDER_SEPARATOR_SAFE_CHECK
+
+    ambiguous = PROVIDER_SEPARATOR_SAFE_CHECK()
+    assert ambiguous == [], f"colon-ambiguous catalogue ids: {ambiguous}"
+
+
+# --------------------------------------------------------------------------
+# Tool-call arguments that arrive serialised twice
+# --------------------------------------------------------------------------
+
+#: What `watsonx/ibm/granite-4-h-small` actually sends: the arguments object,
+#: serialised, then serialised again. Captured from a live call.
+_DOUBLE_ENCODED_ARGUMENTS = '"{\\n  \\"query\\": \\"Earned Leaves\\"\\n}"'
+_WELL_FORMED_ARGUMENTS = '{"query": "Earned Leaves"}'
+
+
+def test_normalise_tool_arguments_unwraps_a_double_encoded_payload():
+    from services.llm_gateway import _normalise_tool_arguments
+
+    arguments, repaired = _normalise_tool_arguments(_DOUBLE_ENCODED_ARGUMENTS)
+
+    assert repaired is True
+    assert json.loads(arguments) == {"query": "Earned Leaves"}
+
+
+def test_normalise_tool_arguments_leaves_well_formed_payloads_untouched():
+    from services.llm_gateway import _normalise_tool_arguments
+
+    for payload in (_WELL_FORMED_ARGUMENTS, "{}", '   {"a": 1}', "not json", "", None):
+        assert _normalise_tool_arguments(payload) == (payload, False)
+
+
+def test_normalise_tool_arguments_serialises_a_mapping():
+    """Some providers send the object itself; OpenAI clients parse a string."""
+    from services.llm_gateway import _normalise_tool_arguments
+
+    arguments, repaired = _normalise_tool_arguments({"query": "x"})
+    assert repaired is True
+    assert json.loads(arguments) == {"query": "x"}
+
+
+def test_normalise_tool_arguments_refuses_a_quoted_scalar():
+    """`"hello"` is a string, not an arguments object — leave it for the client."""
+    from services.llm_gateway import _normalise_tool_arguments
+
+    assert _normalise_tool_arguments('"hello"') == ('"hello"', False)
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_repairs_double_encoded_tool_arguments(monkeypatch):
+    """Non-streaming: the client must receive arguments it can parse into a mapping."""
+
+    async def fake(**kwargs):
+        return {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "search_documents",
+                                    "arguments": _DOUBLE_ENCODED_ARGUMENTS,
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+
+    monkeypatch.setattr("litellm.acompletion", fake)
+    payload = await chat_completions(
+        {"model": "watsonx:ibm/granite-4-h-small", "messages": []}, config=_config()
+    )
+
+    arguments = payload["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(arguments) == {"query": "Earned Leaves"}
+
+
+def _tool_call_deltas(fragments, name="search_documents", call_id="call_1"):
+    """One chunk per fragment, the way a provider streams a tool call."""
+    chunks = [
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "index": 0,
+                                "function": {"name": name, "arguments": ""},
+                            }
+                        ],
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        }
+    ]
+    for fragment in fragments:
+        chunks.append(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": None,
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": None,
+                                    "type": "function",
+                                    "index": 0,
+                                    "function": {"name": "", "arguments": fragment},
+                                }
+                            ],
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            }
+        )
+    chunks.append(
+        {"choices": [{"index": 0, "delta": {"content": None}, "finish_reason": "tool_calls"}]}
+    )
+    return chunks
+
+
+def _streamed_tool_calls(lines):
+    """Every tool call the gateway put on the wire, in order."""
+    calls = []
+    for line in lines:
+        if not line.startswith("data: ") or line.startswith("data: [DONE]"):
+            continue
+        for choice in json.loads(line[len("data: ") :]).get("choices") or []:
+            calls.extend((choice.get("delta") or {}).get("tool_calls") or [])
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_reassembles_and_repairs_fragmented_tool_arguments():
+    """The granite-4 symptom: fragments only reveal the double encoding once joined."""
+    from services import llm_gateway
+
+    # Exactly how the model splits it on the wire.
+    fragments = [
+        '"{\\',
+        "n",
+        " ",
+        ' \\"',
+        "query",
+        '\\":',
+        ' \\"',
+        "Earned Leaves",
+        '\\"\\',
+        "n",
+        '}"',
+    ]
+
+    async def gen():
+        for chunk in _tool_call_deltas(fragments):
+            yield chunk
+
+    lines = [
+        line
+        async for line in llm_gateway._stream_sse(gen(), "watsonx", "watsonx/ibm/granite-4-h-small")
+    ]
+
+    calls = _streamed_tool_calls(lines)
+    assert len(calls) == 1, "fragments must be emitted as one complete tool call"
+    assert calls[0]["id"] == "call_1"
+    assert calls[0]["function"]["name"] == "search_documents"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"query": "Earned Leaves"}
+    assert lines[-1] == "data: [DONE]\n\n"
+    # The finishing chunk still arrives, and after the tool call.
+    assert '"finish_reason": "tool_calls"' in lines[-2]
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_leaves_a_well_formed_tool_call_intact():
+    """Reassembly must be lossless for providers that already behave."""
+    from services import llm_gateway
+
+    fragments = ['{"', "query", '": "', "Earned Leaves", '"}']
+
+    async def gen():
+        for chunk in _tool_call_deltas(fragments):
+            yield chunk
+
+    lines = [line async for line in llm_gateway._stream_sse(gen(), "openai", "gpt-4o-mini")]
+
+    calls = _streamed_tool_calls(lines)
+    assert len(calls) == 1
+    assert json.loads(calls[0]["function"]["arguments"]) == {"query": "Earned Leaves"}
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_keeps_content_flowing_while_tool_calls_are_held():
+    """Buffering tool calls must not delay or drop streamed text."""
+    from services import llm_gateway
+
+    async def gen():
+        yield {"choices": [{"index": 0, "delta": {"content": "th"}}]}
+        yield {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": "inking",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "index": 0,
+                                "type": "function",
+                                "function": {"name": "t", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        yield {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+
+    lines = [line async for line in llm_gateway._stream_sse(gen(), "openai", "gpt-4o-mini")]
+
+    text = "".join(
+        (choice.get("delta") or {}).get("content") or ""
+        for line in lines
+        if line.startswith("data: ") and not line.startswith("data: [DONE]")
+        for choice in json.loads(line[len("data: ") :]).get("choices") or []
+    )
+    assert text == "thinking"
+    assert len(_streamed_tool_calls(lines)) == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_flushes_tool_calls_when_the_provider_sends_no_finish_reason():
+    from services import llm_gateway
+
+    async def gen():
+        yield {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "index": 0,
+                                "type": "function",
+                                "function": {
+                                    "name": "search_documents",
+                                    "arguments": _DOUBLE_ENCODED_ARGUMENTS,
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+
+    lines = [
+        line
+        async for line in llm_gateway._stream_sse(gen(), "watsonx", "watsonx/ibm/granite-4-h-small")
+    ]
+
+    calls = _streamed_tool_calls(lines)
+    assert len(calls) == 1
+    assert json.loads(calls[0]["function"]["arguments"]) == {"query": "Earned Leaves"}
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_logs_the_repair(monkeypatch):
+    from services import llm_gateway
+
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(llm_gateway, "logger", recorder)
+
+    async def gen():
+        for chunk in _tool_call_deltas(['"{\\', 'n \\"query\\": \\"x\\"\\', 'n}"']):
+            yield chunk
+
+    [
+        line
+        async for line in llm_gateway._stream_sse(gen(), "watsonx", "watsonx/ibm/granite-4-h-small")
+    ]
+
+    warnings = [call for call in recorder.calls if call[0] == "warning"]
+    assert any("Repaired double-encoded tool call arguments" in call[1] for call in warnings)
+    _level, _event, fields = next(call for call in warnings if "Repaired" in call[1])
+    assert fields["model"] == "watsonx/ibm/granite-4-h-small"
+    assert fields["tool_calls"] == 1
+
+
+# --------------------------------------------------------------------------
+# Tool calls a provider splits across the wrong index
+# --------------------------------------------------------------------------
+
+
+def _orphaned_fragment_deltas():
+    """The gpt-oss-on-vLLM symptom: the closing brace lands under the next index.
+
+    Taken literally this truncates the real call's arguments *and* invents a
+    second call with no id and no name — the exact pair that makes the assistant
+    message the agent replays unacceptable to vLLM on every later turn.
+    """
+    opening = {
+        "id": "chatcmpl-tool-1",
+        "type": "function",
+        "index": 0,
+        "function": {"name": "search_documents", "arguments": ""},
+    }
+    fragments = ['{\n  "query": "AMCOR', ' signatories"\n']
+    chunks = [{"choices": [{"index": 0, "delta": {"tool_calls": [opening]}}]}]
+    chunks += [
+        {
+            "choices": [
+                {"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": f}}]}}
+            ]
+        }
+        for f in fragments
+    ]
+    # The stray one: same content, wrong index, and nothing naming a call.
+    chunks.append(
+        {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [{"index": 1, "function": {"arguments": "}"}}]},
+                }
+            ]
+        }
+    )
+    chunks.append({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+    return chunks
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_rejoins_a_fragment_misfiled_under_the_next_index():
+    from services import llm_gateway
+
+    async def gen():
+        for chunk in _orphaned_fragment_deltas():
+            yield chunk
+
+    lines = [line async for line in llm_gateway._stream_sse(gen(), "rhoai", "hosted_vllm/gpt-oss")]
+
+    calls = _streamed_tool_calls(lines)
+    assert len(calls) == 1, "the stray fragment must not become a second tool call"
+    assert calls[0]["id"] == "chatcmpl-tool-1"
+    assert calls[0]["function"]["name"] == "search_documents"
+    # The closing brace is back where it belongs, so the arguments parse.
+    assert json.loads(calls[0]["function"]["arguments"]) == {"query": "AMCOR signatories"}
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_drops_a_buffered_call_that_names_no_tool(monkeypatch):
+    """Backstop: a call with no name can never be executed, so it must not ship."""
+    from services import llm_gateway
+
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(llm_gateway, "logger", recorder)
+
+    async def gen():
+        yield {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {"id": "call_1", "index": 0, "function": {"arguments": "{}"}}
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+
+    lines = [line async for line in llm_gateway._stream_sse(gen(), "rhoai", "hosted_vllm/gpt-oss")]
+
+    assert _streamed_tool_calls(lines) == []
+    assert any(call[0] == "warning" and "named no tool" in call[1] for call in recorder.calls)
+
+
+def _tool_call_chunk(*tool_calls, finish_reason=None):
+    choice = {"index": 0, "delta": {"tool_calls": list(tool_calls)}}
+    if finish_reason:
+        choice["finish_reason"] = finish_reason
+    return {"choices": [choice]}
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_keeps_an_arguments_fragment_that_arrives_before_the_call_is_named():
+    """Nothing is open yet, so the fragment must wait for its call, not vanish."""
+    from services import llm_gateway
+
+    async def gen():
+        yield _tool_call_chunk({"index": 0, "function": {"arguments": '{"query": '}})
+        yield _tool_call_chunk(
+            {
+                "id": "call_1",
+                "type": "function",
+                "index": 0,
+                "function": {"name": "search_documents", "arguments": '"x"}'},
+            }
+        )
+        yield {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+
+    lines = [line async for line in llm_gateway._stream_sse(gen(), "rhoai", "hosted_vllm/gpt-oss")]
+
+    calls = _streamed_tool_calls(lines)
+    assert len(calls) == 1
+    assert calls[0]["id"] == "call_1"
+    assert calls[0]["function"]["name"] == "search_documents"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"query": "x"}
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_rejoins_both_a_leading_and_a_misfiled_trailing_fragment():
+    """The provisional call must not undo the next-index rejoin, and vice versa."""
+    from services import llm_gateway
+
+    async def gen():
+        yield _tool_call_chunk({"index": 0, "function": {"arguments": "{"}})
+        yield _tool_call_chunk(
+            {
+                "id": "call_1",
+                "type": "function",
+                "index": 0,
+                "function": {"name": "search_documents", "arguments": '"query": "x"'},
+            }
+        )
+        yield _tool_call_chunk({"index": 1, "function": {"arguments": "}"}})
+        yield {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+
+    lines = [line async for line in llm_gateway._stream_sse(gen(), "rhoai", "hosted_vllm/gpt-oss")]
+
+    calls = _streamed_tool_calls(lines)
+    assert len(calls) == 1, "neither stray fragment may become a call of its own"
+    assert calls[0]["id"] == "call_1"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"query": "x"}
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_drops_an_unnamed_fragment_no_call_ever_claims(monkeypatch):
+    """A provisional call that never gets a name is still discarded at drain."""
+    from services import llm_gateway
+
+    recorder = _RecordingLogger()
+    monkeypatch.setattr(llm_gateway, "logger", recorder)
+
+    async def gen():
+        yield _tool_call_chunk({"index": 0, "function": {"arguments": "{}"}})
+        yield {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+
+    lines = [line async for line in llm_gateway._stream_sse(gen(), "rhoai", "hosted_vllm/gpt-oss")]
+
+    assert _streamed_tool_calls(lines) == []
+    assert any(call[0] == "warning" and "named no tool" in call[1] for call in recorder.calls)
+    # Nothing reached the client, so it is told why rather than left hanging.
+    assert any('"code": "upstream_error"' in line for line in lines)
+    assert lines[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_mints_an_id_for_a_named_call_that_has_none():
+    """A named call is real work; only its correlation handle is missing."""
+    from services import llm_gateway
+
+    async def gen():
+        yield {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"name": "search_documents", "arguments": "{}"},
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+
+    lines = [line async for line in llm_gateway._stream_sse(gen(), "rhoai", "hosted_vllm/gpt-oss")]
+
+    calls = _streamed_tool_calls(lines)
+    assert len(calls) == 1
+    assert isinstance(calls[0]["id"], str) and calls[0]["id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fragments", [[], ["  "]], ids=["no-fragment", "whitespace-fragment"])
+async def test_stream_sse_defaults_a_zero_argument_call_to_an_empty_object(fragments):
+    """`""` is not a JSON object; clients that parse arguments must get `{}`."""
+    from services import llm_gateway
+
+    async def gen():
+        for chunk in _tool_call_deltas(fragments, name="list_sources"):
+            yield chunk
+
+    lines = [line async for line in llm_gateway._stream_sse(gen(), "rhoai", "hosted_vllm/gpt-oss")]
+
+    calls = _streamed_tool_calls(lines)
+    assert len(calls) == 1
+    assert calls[0]["id"] == "call_1"
+    assert calls[0]["function"]["name"] == "list_sources"
+    assert json.loads(calls[0]["function"]["arguments"]) == {}
+
+
+def test_finalise_tool_call_leaves_real_arguments_alone():
+    from services.llm_gateway import _finalise_tool_call
+
+    call = {"id": "call_1", "function": {"name": "search", "arguments": _WELL_FORMED_ARGUMENTS}}
+    assert _finalise_tool_call(call) is True
+    assert call["function"]["arguments"] == _WELL_FORMED_ARGUMENTS
+
+
+def test_finalise_tool_call_does_not_default_arguments_on_a_nameless_call():
+    from services.llm_gateway import _finalise_tool_call
+
+    call = {"id": "call_1", "function": {"name": "", "arguments": ""}}
+    assert _finalise_tool_call(call) is False
+    assert call["function"]["arguments"] == ""
+
+
+# --------------------------------------------------------------------------
+# A poisoned conversation must not wedge every later turn
+# --------------------------------------------------------------------------
+
+
+def test_sanitise_messages_drops_a_tool_call_naming_no_tool_and_its_result():
+    """vLLM rejects the whole request over this one message, so it cannot go up."""
+    from services import llm_gateway
+
+    messages = [
+        {"role": "user", "content": "For the AMCOR form, who are the signatories?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "id": "call_1",
+                    "function": {"name": "search_documents", "arguments": '{"query": "AMCOR"}'},
+                },
+                # What langchain-openai echoes back for an unparseable call.
+                {"type": "function", "id": None, "function": {"name": "", "arguments": "}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "…"},
+        {"role": "tool", "tool_call_id": None, "content": "…"},
+    ]
+
+    cleaned, repairs = llm_gateway._sanitise_messages(messages)
+
+    assert repairs == 2
+    assert [m["role"] for m in cleaned] == ["user", "assistant", "tool"]
+    assert [c["id"] for c in cleaned[1]["tool_calls"]] == ["call_1"]
+
+
+def test_sanitise_messages_encodes_object_arguments_as_the_json_string_openai_requires():
+    from services import llm_gateway
+
+    cleaned, repairs = llm_gateway._sanitise_messages(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "id": "call_1",
+                        "function": {"name": "search", "arguments": {"query": "AMCOR"}},
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert repairs == 1
+    assert cleaned[0]["tool_calls"][0]["function"]["arguments"] == '{"query": "AMCOR"}'
+
+
+def test_sanitise_messages_removes_a_tool_calls_key_left_empty():
+    """`tool_calls: null` is itself a shape providers iterate without a None check."""
+    from services import llm_gateway
+
+    cleaned, repairs = llm_gateway._sanitise_messages(
+        [{"role": "assistant", "content": "hello", "tool_calls": None}]
+    )
+
+    assert "tool_calls" not in cleaned[0]
+    assert cleaned[0]["content"] == "hello"
+    assert repairs == 0
+
+
+@pytest.mark.parametrize("function", ["search", 42, ["name", "search"]])
+def test_sanitise_messages_drops_a_call_whose_function_is_not_an_object(function):
+    """Malformed history is the sanitiser's job to absorb, not to crash on."""
+    from services import llm_gateway
+
+    good = {"type": "function", "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
+    cleaned, repairs = llm_gateway._sanitise_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [good, {"type": "function", "id": "call_2", "function": function}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "kept"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "orphaned"},
+        ]
+    )
+
+    assert repairs == 2
+    assert [call["id"] for call in cleaned[0]["tool_calls"]] == ["call_1"]
+    assert [m["content"] for m in cleaned[1:]] == ["kept"]
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_absorbs_a_non_object_function_instead_of_raising(monkeypatch):
+    """It runs before the call's error handling, so a raise here was a bare 500."""
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return {"id": "1", "choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    await chat_completions(
+        {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"type": "function", "id": "call_1", "function": "oops"}],
+                },
+            ],
+        },
+        config=_config(),
+    )
+
+    assert captured["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_sanitise_messages_drops_the_result_of_a_dropped_call_that_had_an_id():
+    """The result carries a real id, but the call it answers is gone."""
+    from services import llm_gateway
+
+    cleaned, repairs = llm_gateway._sanitise_messages(
+        [
+            {"role": "user", "content": "q"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "id": "call_1",
+                        "function": {"name": "search", "arguments": "{}"},
+                    },
+                    {
+                        "type": "function",
+                        "id": "call_2",
+                        "function": {"name": "", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "kept"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "orphaned"},
+        ]
+    )
+
+    assert repairs == 2
+    assert [m.get("content") for m in cleaned if m["role"] == "tool"] == ["kept"]
+
+
+def test_sanitise_messages_drops_an_assistant_message_that_was_only_bad_calls():
+    """`content` is optional only beside `tool_calls`; with neither, nothing is left."""
+    from services import llm_gateway
+
+    cleaned, repairs = llm_gateway._sanitise_messages(
+        [
+            {"role": "user", "content": "q"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "id": "call_2",
+                        "function": {"name": "", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_2", "content": "orphaned"},
+            {"role": "user", "content": "again"},
+        ]
+    )
+
+    assert repairs == 2
+    assert cleaned == [{"role": "user", "content": "q"}, {"role": "user", "content": "again"}]
+
+
+def test_sanitise_messages_keeps_an_assistant_message_that_still_has_content():
+    from services import llm_gateway
+
+    cleaned, _ = llm_gateway._sanitise_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "Let me look.",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "id": "call_2",
+                        "function": {"name": "", "arguments": "{}"},
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert cleaned == [{"role": "assistant", "content": "Let me look."}]
+
+
+def test_sanitise_messages_drops_a_result_not_answering_the_preceding_assistant_message():
+    """A result only answers the calls of the assistant message just before it."""
+    from services import llm_gateway
+
+    call = {"type": "function", "id": "call_1", "function": {"name": "search", "arguments": "{}"}}
+    cleaned, repairs = llm_gateway._sanitise_messages(
+        [
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "answer"},
+            {"role": "user", "content": "next"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "replayed out of place"},
+        ]
+    )
+
+    assert repairs == 1
+    assert [m.get("content") for m in cleaned] == ["", "answer", "next"]
+
+
+def test_sanitise_messages_keeps_every_result_of_parallel_calls():
+    from services import llm_gateway
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"type": "function", "id": "a", "function": {"name": "search", "arguments": "{}"}},
+                {"type": "function", "id": "b", "function": {"name": "search", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "b", "content": "second"},
+        {"role": "tool", "tool_call_id": "a", "content": "first"},
+    ]
+
+    cleaned, repairs = llm_gateway._sanitise_messages(messages)
+
+    assert repairs == 0
+    assert cleaned == messages
+
+
+def test_sanitise_messages_leaves_a_healthy_conversation_untouched():
+    from services import llm_gateway
+
+    messages = [
+        {"role": "system", "content": "be helpful"},
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "id": "call_1",
+                    "function": {"name": "search", "arguments": '{"query": "x"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+
+    cleaned, repairs = llm_gateway._sanitise_messages(messages)
+
+    assert repairs == 0
+    assert cleaned == messages
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_sends_the_sanitised_conversation_upstream(monkeypatch):
+    """The repair has to reach the wire, not just exist as a helper."""
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return {"id": "1", "choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    await chat_completions(
+        {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"type": "function", "id": None, "function": {"name": "", "arguments": "}"}}
+                    ],
+                },
+            ],
+        },
+        config=_config(),
+    )
+
+    # The assistant message held nothing but the unusable call, so it goes too.
+    assert captured["messages"] == [{"role": "user", "content": "hi"}]
+
+
+# --------------------------------------------------------------------------
+# Surfacing the real upstream failure
+# --------------------------------------------------------------------------
+
+
+class _FakeLiteLLMError(Exception):
+    """Stands in for a LiteLLM exception: tagged with the provider it called."""
+
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.llm_provider = "watsonx"
+        self.status_code = status_code
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_surfaces_the_provider_error_body(monkeypatch):
+    """An operator must be able to read what the provider actually objected to."""
+
+    async def boom(**kwargs):
+        raise _FakeLiteLLMError(
+            'OpenAILikeError: {"errors":[{"code":"model_not_supported","message":'
+            "\"Model 'ibm/granite-3-3-8b-instruct' was not found. This model may be "
+            'unsupported, deprecated, or removed."}],"status_code":404}'
+        )
+
+    monkeypatch.setattr("litellm.acompletion", boom)
+    with pytest.raises(LlmGatewayError) as exc:
+        await chat_completions(
+            {"model": "watsonx:ibm/granite-3-3-8b-instruct", "messages": []}, config=_config()
+        )
+
+    assert "watsonx/ibm/granite-3-3-8b-instruct" in exc.value.message
+    assert "was not found" in exc.value.message
+    assert "OpenAILikeError" not in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_surfaces_a_litellm_exception_without_a_json_body(monkeypatch):
+    async def boom(**kwargs):
+        raise _FakeLiteLLMError("BadRequestError: tool_choice is not supported for this model")
+
+    monkeypatch.setattr("litellm.acompletion", boom)
+    with pytest.raises(LlmGatewayError) as exc:
+        await chat_completions({"model": "gpt-4o-mini", "messages": []}, config=_config())
+
+    assert "tool_choice is not supported" in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_passes_through_a_rate_limit_status(monkeypatch):
+    async def boom(**kwargs):
+        raise _FakeLiteLLMError("rate limit exceeded, retry in 30s", status_code=429)
+
+    monkeypatch.setattr("litellm.acompletion", boom)
+    with pytest.raises(LlmGatewayError) as exc:
+        await chat_completions({"model": "gpt-4o-mini", "messages": []}, config=_config())
+
+    assert exc.value.status_code == 429
+    assert "rate limit exceeded" in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_masks_an_upstream_4xx_as_a_gateway_failure(monkeypatch):
+    """An upstream 401 must not read to the client as an OpenRAG auth failure."""
+
+    async def boom(**kwargs):
+        raise _FakeLiteLLMError("model does not exist", status_code=404)
+
+    monkeypatch.setattr("litellm.acompletion", boom)
+    with pytest.raises(LlmGatewayError) as exc:
+        await chat_completions({"model": "gpt-4o-mini", "messages": []}, config=_config())
+
+    assert exc.value.status_code == 502
+
+
+class _FakeMidStreamFallbackError(Exception):
+    llm_provider = "hosted_vllm"
+
+
+_PROXY_CUTOFF = (
+    "litellm.MidStreamFallbackError: litellm.APIConnectionError: APIConnectionError: "
+    "Hosted_vllmException - Response payload is not completed: <TransferEncodingError: 400, "
+    "message='Not enough data to satisfy transfer length header.'>"
+)
+
+
+def test_a_truncated_response_names_the_proxy_not_the_wrapper_chain():
+    """aiohttp's own "400" must not read as the model rejecting the request."""
+    from services.llm_gateway import _upstream_client_message
+
+    message = _upstream_client_message(
+        f"MidStreamFallbackError: {_PROXY_CUTOFF}",
+        "rhoai",
+        "hosted_vllm/qwen2.5-0.5b-instruct",
+        _FakeMidStreamFallbackError(_PROXY_CUTOFF),
+    )
+
+    assert "closed before the response finished" in message
+    assert "timed out" in message
+    assert "rhoai/qwen2.5-0.5b-instruct" in message
+    for noise in ("MidStreamFallbackError", "TransferEncodingError", "400"):
+        assert noise not in message
+
+
+@pytest.mark.asyncio
+async def test_a_mid_stream_cutoff_is_reported_and_still_latches_the_banner():
+    """Unlike a context overflow, this fails every long request on that endpoint."""
+    from services import llm_gateway, provider_error_log
+
+    provider_error_log.clear()
+
+    async def gen():
+        raise _FakeMidStreamFallbackError(_PROXY_CUTOFF)
+        yield  # pragma: no cover - makes this an async generator
+
+    try:
+        lines = [
+            line
+            async for line in llm_gateway._stream_sse(
+                gen(), "rhoai", "hosted_vllm/qwen2.5-0.5b-instruct"
+            )
+        ]
+        error = json.loads(lines[-2][len("data: ") :])["error"]
+        assert "closed before the response finished" in error["message"]
+        assert provider_error_log.latest_failure("rhoai", "chat") == error["message"]
+    finally:
+        provider_error_log.clear()
+
+
+def test_sanitise_upstream_detail_drops_interpreter_state():
+    from services.llm_gateway import _sanitise_upstream_detail
+
+    text = _sanitise_upstream_detail(
+        "ConnectError: connect to 10.0.0.5 failed\n"
+        'Traceback (most recent call last):\n  File "/srv/app/litellm/router.py", line 42'
+    )
+    for leak in ("Traceback", "/srv/app", "10.0.0.5"):
+        assert leak not in text
+    assert "connect to <host> failed" in text
+
+
+def test_sanitise_upstream_detail_caps_a_runaway_body():
+    from services import llm_gateway
+
+    text = llm_gateway._sanitise_upstream_detail("x" * 5000)
+    assert len(text) <= llm_gateway._MAX_UPSTREAM_MESSAGE_CHARS
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_emits_an_error_frame_when_the_provider_fails_mid_stream():
+    """A truncated stream reads as "no response"; an error frame reads as the cause."""
+    from services import llm_gateway
+
+    async def gen():
+        yield {"choices": [{"index": 0, "delta": {"content": "par"}}]}
+        raise _FakeLiteLLMError('{"error":{"message":"context window exceeded"}}')
+
+    lines = [
+        line
+        async for line in llm_gateway._stream_sse(
+            gen(), "watsonx", "watsonx/ibm/granite-4-h-small", {"api_key": "wx-key"}
+        )
+    ]
+
+    assert lines[-1] == "data: [DONE]\n\n"
+    error = json.loads(lines[-2][len("data: ") :])["error"]
+    assert "context window exceeded" in error["message"]
+    assert error["provider"] == "watsonx"
+    assert error["model"] == "watsonx/ibm/granite-4-h-small"
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_keeps_credentials_out_of_the_error_frame():
+    from services import llm_gateway
+
+    async def gen():
+        raise _FakeLiteLLMError("rejected token wx-super-secret-key")
+        yield  # pragma: no cover - generator marker
+
+    lines = [
+        line
+        async for line in llm_gateway._stream_sse(
+            gen(), "watsonx", "watsonx/ibm/granite-4-h-small", {"api_key": "wx-super-secret-key"}
+        )
+    ]
+
+    assert "wx-super-secret-key" not in "".join(lines)
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_reports_an_empty_completion_instead_of_going_silent():
+    """A 200 that carries nothing must name itself, not read as a dead connection."""
+    from services import llm_gateway
+
+    async def gen():
+        yield {"choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "stop"}]}
+
+    lines = [
+        line
+        async for line in llm_gateway._stream_sse(gen(), "watsonx", "watsonx/ibm/granite-4-h-small")
+    ]
+
+    assert lines[-1] == "data: [DONE]\n\n"
+    error = json.loads(lines[-2][len("data: ") :])["error"]
+    assert "no content and no tool calls" in error["message"]
+    assert "finish_reason: stop" in error["message"]
+    assert "watsonx/ibm/granite-4-h-small" in error["message"]
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_stays_quiet_when_the_completion_carried_content():
+    from services import llm_gateway
+
+    async def gen():
+        yield {"choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]}
+
+    lines = [line async for line in llm_gateway._stream_sse(gen(), "openai", "gpt-4o-mini")]
+
+    assert not any('"error"' in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_counts_a_repaired_tool_call_as_output():
+    """The repair must clear the empty-completion path, not trip it."""
+    from services import llm_gateway
+
+    async def gen():
+        for chunk in _tool_call_deltas(['"{\\', 'n \\"query\\": \\"x\\"\\', 'n}"']):
+            yield chunk
+
+    lines = [
+        line
+        async for line in llm_gateway._stream_sse(gen(), "watsonx", "watsonx/ibm/granite-4-h-small")
+    ]
+
+    assert not any('"error"' in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_stream_sse_reports_a_stream_that_never_yielded_a_chunk():
+    from services import llm_gateway
+
+    async def gen():
+        return
+        yield  # pragma: no cover - generator marker
+
+    lines = [line async for line in llm_gateway._stream_sse(gen(), "openai", "gpt-4o-mini")]
+
+    error = json.loads(lines[-2][len("data: ") :])["error"]
+    assert "no content and no tool calls" in error["message"]
+
+
+class TestRealFailuresReachTheBanner:
+    """What the caller is told and what the banner shows must be the same text.
+
+    The health probe issues its own request and so hits its own error. Recording
+    the gateway's actual failure is what lets the banner report the one the
+    user's traffic produced.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from services import provider_error_log
+
+        provider_error_log.clear()
+        yield
+        provider_error_log.clear()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_completion_is_recorded_verbatim(self, monkeypatch):
+        from services import llm_gateway, provider_error_log
+
+        monkeypatch.setattr(
+            llm_gateway, "resolve_call", lambda *a, **k: ("gpt-5.6-luna", "openai", {})
+        )
+
+        async def _boom(**_kwargs):
+            raise RuntimeError(
+                '{"error": {"message": "Function tools with reasoning_effort are not supported"}}'
+            )
+
+        monkeypatch.setattr("litellm.acompletion", _boom)
+
+        with pytest.raises(llm_gateway.LlmGatewayError) as raised:
+            await llm_gateway.chat_completions({"model": "gpt-5.6-luna", "messages": []})
+
+        recorded = provider_error_log.latest_failure("openai", "chat")
+        assert recorded == str(raised.value)
+        assert "reasoning_effort" in recorded
+
+    @pytest.mark.asyncio
+    async def test_a_later_success_clears_the_record(self, monkeypatch):
+        from services import llm_gateway, provider_error_log
+
+        provider_error_log.record_failure("openai", "chat", "stale failure")
+        monkeypatch.setattr(llm_gateway, "resolve_call", lambda *a, **k: ("gpt-4o", "openai", {}))
+
+        async def _ok(**_kwargs):
+            return {"choices": [{"message": {"content": "hi"}}]}
+
+        monkeypatch.setattr("litellm.acompletion", _ok)
+
+        await llm_gateway.chat_completions({"model": "gpt-4o", "messages": []})
+
+        assert provider_error_log.latest_failure("openai", "chat") is None
+
+
+class TestRequestScopedFailuresStayOutOfTheBanner:
+    """A prompt that overflows the context window is this request's problem.
+
+    The provider is serving; the next, shorter prompt succeeds. Recording it
+    latched the health banner against a healthy provider, and on one whose
+    probe cannot clear it (every provider enhancement), it stayed latched.
+    """
+
+    _OVERFLOW = (
+        "This model's maximum context length is 32768 tokens. However, you requested 0 "
+        "output tokens and your prompt contains at least 32769 input tokens"
+    )
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        from services import llm_gateway, provider_error_log
+
+        provider_error_log.clear()
+        monkeypatch.setattr(
+            llm_gateway,
+            "resolve_call",
+            lambda *a, **k: ("hosted_vllm/qwen2.5-0.5b-instruct", "rhoai", {}),
+        )
+        yield
+        provider_error_log.clear()
+
+    def _raise(self, monkeypatch, exc: BaseException):
+        async def _boom(**_kwargs):
+            raise exc
+
+        monkeypatch.setattr("litellm.acompletion", _boom)
+
+    @pytest.mark.asyncio
+    async def test_a_context_window_overflow_is_not_recorded(self, monkeypatch):
+        """Report chat overflow as a coded 400 without recording a provider failure."""
+        from services import llm_gateway, provider_error_log
+
+        class ContextWindowExceededError(Exception):
+            llm_provider = "hosted_vllm"
+
+        self._raise(monkeypatch, ContextWindowExceededError(self._OVERFLOW))
+
+        with pytest.raises(llm_gateway.LlmGatewayError) as raised:
+            await llm_gateway.chat_completions({"model": "rhoai:qwen", "messages": []})
+
+        assert "maximum context length" in str(raised.value)
+        assert provider_error_log.latest_failure("rhoai", "chat") is None
+        # The caller's own doing, so it is told so: OpenAI's status and code.
+        assert isinstance(raised.value, llm_gateway.LlmContextLengthError)
+        assert raised.value.status_code == 400
+        assert raised.value.code == "context_length_exceeded"
+        assert (raised.value.max_tokens, raised.value.requested_tokens) == (32768, 32769)
+
+    @pytest.mark.asyncio
+    async def test_an_overflow_does_not_erase_a_real_failure(self, monkeypatch):
+        from services import llm_gateway, provider_error_log
+
+        provider_error_log.record_failure("rhoai", "chat", "earlier real failure")
+        self._raise(monkeypatch, RuntimeError(self._OVERFLOW))
+
+        with pytest.raises(llm_gateway.LlmGatewayError):
+            await llm_gateway.chat_completions({"model": "rhoai:qwen", "messages": []})
+
+        assert provider_error_log.latest_failure("rhoai", "chat") == "earlier real failure"
+
+    @pytest.mark.asyncio
+    async def test_other_upstream_failures_are_still_recorded(self, monkeypatch):
+        from services import llm_gateway, provider_error_log
+
+        self._raise(
+            monkeypatch,
+            RuntimeError('{"error": {"message": "The model `qwen` does not exist."}}'),
+        )
+
+        with pytest.raises(llm_gateway.LlmGatewayError):
+            await llm_gateway.chat_completions({"model": "rhoai:qwen", "messages": []})
+
+        assert "does not exist" in provider_error_log.latest_failure("rhoai", "chat")
+
+    @pytest.mark.asyncio
+    async def test_a_mid_stream_overflow_is_reported_but_not_recorded(self):
+        """Emit a context-length SSE error without adding a provider health failure."""
+        from services import llm_gateway, provider_error_log
+
+        overflow = self._OVERFLOW
+
+        class BadRequestError(Exception):
+            llm_provider = "hosted_vllm"
+
+        async def gen():
+            raise BadRequestError(overflow)
+            yield  # pragma: no cover - makes this an async generator
+
+        lines = [line async for line in llm_gateway._stream_sse(gen(), "rhoai", "qwen")]
+
+        error = json.loads(lines[-2][len("data: ") :])["error"]
+        assert "maximum context length" in error["message"]
+        assert error["code"] == "context_length_exceeded"
+        assert provider_error_log.latest_failure("rhoai", "chat") is None
+
+
+#: The provider's sentence from tracker issue 93001, in a watsonx error body.
+_EMBEDDING_OVERFLOW = (
+    'watsonxException - {"errors":[{"message":"Invalid input argument for Model '
+    "'intfloat/multilingual-e5-large': This model's maximum context length is 512 tokens. "
+    "However, you requested 548 tokens in the input for embedding generation. Please reduce "
+    'the length of the input."}]}'
+)
+_E5 = {"model": "watsonx:intfloat/multilingual-e5-large", "input": ["one long chunk"]}
+
+
+class TestAnOverLengthEmbeddingInput:
+    """One chunk too long for the model is that chunk's problem, not the provider's.
+
+    It used to come back as a 502 and latch the health banner against a
+    provider that was embedding every other chunk of the document fine.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        """Clear provider failures before and after each embedding overflow test."""
+        from services import provider_error_log
+
+        provider_error_log.clear()
+        yield
+        provider_error_log.clear()
+
+    def _raise(self, monkeypatch, exc: BaseException):
+        """Make the embedding provider raise the supplied exception."""
+
+        async def _boom(**_kwargs):
+            """Simulate a failed upstream embedding call."""
+            raise exc
+
+        monkeypatch.setattr("litellm.aembedding", _boom)
+
+    @pytest.mark.asyncio
+    async def test_it_is_a_400_carrying_the_openai_code_and_the_providers_words(self, monkeypatch):
+        """Keep the provider's message and token counts in a typed context-length 400."""
+        self._raise(monkeypatch, _FakeLiteLLMError(_EMBEDDING_OVERFLOW, status_code=400))
+
+        with pytest.raises(LlmContextLengthError) as raised:
+            await embeddings(_E5, config=_config())
+
+        assert raised.value.status_code == 400
+        assert raised.value.code == "context_length_exceeded"
+        assert (raised.value.max_tokens, raised.value.requested_tokens) == (512, 548)
+        assert raised.value.message.startswith("watsonx/intfloat/multilingual-e5-large: ")
+        assert "maximum context length is 512 tokens" in raised.value.message
+
+    @pytest.mark.asyncio
+    async def test_it_is_not_recorded_against_the_provider(self, monkeypatch):
+        """Keep an oversized embedding input out of provider health failures."""
+        from services import provider_error_log
+
+        self._raise(monkeypatch, _FakeLiteLLMError(_EMBEDDING_OVERFLOW, status_code=400))
+
+        with pytest.raises(LlmGatewayError):
+            await embeddings(_E5, config=_config())
+
+        assert provider_error_log.latest_failure("watsonx", "embedding") is None
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_erase_a_real_failure(self, monkeypatch):
+        """Preserve an earlier provider failure when an embedding input is too long."""
+        from services import provider_error_log
+
+        provider_error_log.record_failure("watsonx", "embedding", "earlier real failure")
+        self._raise(monkeypatch, _FakeLiteLLMError(_EMBEDDING_OVERFLOW, status_code=400))
+
+        with pytest.raises(LlmGatewayError):
+            await embeddings(_E5, config=_config())
+
+        assert provider_error_log.latest_failure("watsonx", "embedding") == "earlier real failure"
+
+    @pytest.mark.asyncio
+    async def test_an_overflow_without_counts_still_raises_the_typed_error(self, monkeypatch):
+        """Classify overflow without guessing token counts the provider omitted."""
+        self._raise(monkeypatch, RuntimeError('{"error": {"code": "context_length_exceeded"}}'))
+
+        with pytest.raises(LlmContextLengthError) as raised:
+            await embeddings(_E5, config=_config())
+
+        assert (raised.value.max_tokens, raised.value.requested_tokens) == (None, None)
+
+    @pytest.mark.asyncio
+    async def test_other_embedding_failures_are_still_recorded(self, monkeypatch):
+        """Keep non-context embedding failures as provider failures with a 502 status."""
+        from services import provider_error_log
+
+        self._raise(
+            monkeypatch,
+            _FakeLiteLLMError(
+                '{"error": {"message": "The model `e5` does not exist."}}', status_code=404
+            ),
+        )
+
+        with pytest.raises(LlmGatewayError) as raised:
+            await embeddings(_E5, config=_config())
+
+        assert not isinstance(raised.value, LlmContextLengthError)
+        assert raised.value.status_code == 502
+        assert "does not exist" in provider_error_log.latest_failure("watsonx", "embedding")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream_status", "upstream_text", "status_code", "code"),
+    [
+        # Passed through: a client can act on these itself.
+        (429, "rate limit exceeded, retry in 30s", 429, "rate_limit_exceeded"),
+        (408, "the request took too long", 408, "upstream_timeout"),
+        (504, "no response from the model server", 504, "upstream_timeout"),
+        (503, "the model is still loading", 503, "upstream_unavailable"),
+        # Still a 502, so an upstream 4xx never reads as a bad request to us,
+        # but no longer indistinguishable from one another.
+        (500, "internal error", 502, "upstream_unavailable"),
+        (401, "Incorrect API key provided", 502, "upstream_auth_error"),
+        (403, "this project may not call the model", 502, "upstream_auth_error"),
+        (404, "the model `e5` does not exist", 502, "upstream_invalid_request"),
+        (400, "encoding_format is not supported for this model", 502, "upstream_invalid_request"),
+    ],
+)
+async def test_embeddings_names_an_upstream_failure_and_keeps_its_status(
+    monkeypatch, upstream_status, upstream_text, status_code, code
+):
+    """Map upstream embedding failures to the expected HTTP status and OpenAI code."""
+
+    async def boom(**kwargs):
+        """Raise an embedding failure with the parameterized upstream status."""
+        raise _FakeLiteLLMError(upstream_text, status_code=upstream_status)
+
+    monkeypatch.setattr("litellm.aembedding", boom)
+    with pytest.raises(LlmGatewayError) as exc:
+        await embeddings(_E5, config=_config())
+
+    assert (exc.value.status_code, exc.value.code) == (status_code, code)
+
+
+class _FakeTimeout(ConnectionError):
+    """LiteLLM's Timeout: a connection error by ancestry, a 408 by status."""
+
+    status_code = 408
+
+
+class APIConnectionError(Exception):
+    """Named as LiteLLM's is: the gateway matches on the class name, not the import."""
+
+    status_code = 500
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        # LiteLLM stamps its connection error with a 500; the provider never answered.
+        (APIConnectionError("Cannot connect to host"), ("upstream_unreachable", 502)),
+        (ConnectionRefusedError("[Errno 111] Connection refused"), ("upstream_unreachable", 502)),
+        (
+            RuntimeError("SSLCertVerificationError: certificate verify failed"),
+            ("upstream_unreachable", 502),
+        ),
+        # A timeout is one too, by ancestry, but its own status says more.
+        (_FakeTimeout("timed out"), ("upstream_timeout", 408)),
+        (RuntimeError("something nobody anticipated"), ("upstream_error", 502)),
+    ],
+)
+def test_a_failure_with_no_useful_status_is_named_from_what_raised_it(exc, expected):
+    """Classify transport failures using exception ancestry and text as well as status."""
+    from services.llm_gateway import _classify_upstream_failure
+
+    failure = _classify_upstream_failure(f"{type(exc).__name__}: {exc}", exc)
+
+    assert (failure.code, failure.status_code) == expected
+    assert failure.counts_against_provider
+
+
+def _direction(text: str) -> list[float]:
+    """A unit vector that leans towards "a" or "b" by how much of each the text has."""
+    a, b = text.count("a"), text.count("b")
+    length = math.hypot(a, b) or 1.0
+    return [a / length, b / length]
+
+
+class _LimitedProvider:
+    """Stands in for `litellm.aembedding` at a model with an input limit.
+
+    One character is one token, plus `dense` more for every "z", so a test can
+    pack more tokens into one part of a text than another.
+    """
+
+    def __init__(self, limit: int, *, state_counts: bool = True, dense: int = 0, vector=_direction):
+        self.limit = limit
+        self.state_counts = state_counts
+        self.dense = dense
+        self.vector = vector
+        self.calls: list[list] = []
+        self.rejections = 0
+
+    def tokens(self, text: str) -> int:
+        return len(text) + self.dense * text.count("z")
+
+    async def __call__(self, **kwargs):
+        inputs = kwargs["input"]
+        self.calls.append(list(inputs))
+        longest = max(self.tokens(text) for text in inputs)
+        if longest > self.limit:
+            self.rejections += 1
+            raise _FakeLiteLLMError(
+                f"This model's maximum context length is {self.limit} tokens. However, you "
+                f"requested {longest} tokens in the input for embedding generation."
+                if self.state_counts
+                else '{"error": {"code": "context_length_exceeded"}}',
+                status_code=400,
+            )
+        spent = sum(self.tokens(text) for text in inputs)
+        return {
+            "object": "list",
+            "model": "intfloat/multilingual-e5-large",
+            "data": [
+                {"object": "embedding", "index": index, "embedding": self.vector(text)}
+                for index, text in enumerate(inputs)
+            ],
+            "usage": {"prompt_tokens": spent, "total_tokens": spent},
+        }
+
+
+#: 100 characters against a limit of 80: two pieces of 50, cut at the space.
+_OVER_LIMIT = "a" * 49 + " " + "b" * 50
+_E5_MODEL = "watsonx:intfloat/multilingual-e5-large"
+
+
+class TestAnOverLengthEmbeddingInputIsAveraged:
+    """The gateway embeds an over-length input in pieces and returns their average.
+
+    `/v1/embeddings` owes one vector per input, so the caller cannot be handed
+    more chunks; failing instead stopped whole documents ingesting through
+    flows that have no way to split the chunk themselves.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        from services import provider_error_log
+
+        monkeypatch.delenv("OPENRAG_EMBEDDING_OVERFLOW_POLICY", raising=False)
+        provider_error_log.clear()
+        yield
+        provider_error_log.clear()
+
+    def _provider(self, monkeypatch, provider):
+        monkeypatch.setattr("litellm.aembedding", provider)
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_one_vector_comes_back_for_the_input(self, monkeypatch):
+        from services import provider_error_log
+
+        provider = self._provider(monkeypatch, _LimitedProvider(80))
+
+        result = await embeddings({"model": _E5_MODEL, "input": [_OVER_LIMIT]}, config=_config())
+
+        assert provider.calls == [[_OVER_LIMIT], [_OVER_LIMIT[:50], _OVER_LIMIT[50:]]]
+        # Half "a" and half "b" by length, at the unit length the pieces have.
+        assert result["data"] == [
+            {"object": "embedding", "index": 0, "embedding": pytest.approx([0.5**0.5, 0.5**0.5])}
+        ]
+        assert result["model"] == "intfloat/multilingual-e5-large"
+        assert result["usage"] == {"prompt_tokens": 100, "total_tokens": 100}
+        assert provider_error_log.latest_failure("watsonx", "embedding") is None
+
+    @pytest.mark.asyncio
+    async def test_a_bare_string_input_is_handled_the_same_way(self, monkeypatch):
+        self._provider(monkeypatch, _LimitedProvider(80))
+
+        result = await embeddings({"model": _E5_MODEL, "input": _OVER_LIMIT}, config=_config())
+
+        assert len(result["data"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_warning_gives_the_sizes_and_never_the_text(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from services import llm_gateway
+
+        log = MagicMock()
+        monkeypatch.setattr(llm_gateway, "logger", log)
+        self._provider(monkeypatch, _LimitedProvider(80))
+
+        await embeddings({"model": _E5_MODEL, "input": [_OVER_LIMIT]}, config=_config())
+
+        assert [call.kwargs for call in log.warning.call_args_list] == [
+            {
+                "provider": "watsonx",
+                "model": "watsonx/intfloat/multilingual-e5-large",
+                "max_tokens": 80,
+                "requested_tokens": 100,
+                "chars": 100,
+                "pieces": 2,
+            }
+        ]
+        assert "aaaa" not in repr(log.mock_calls)
+        log.error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_only_the_offending_input_in_a_batch_is_cut(self, monkeypatch):
+        provider = self._provider(monkeypatch, _LimitedProvider(80))
+        batch = ["aaa", _OVER_LIMIT, "bbb", "aab"]
+
+        result = await embeddings({"model": _E5_MODEL, "input": batch}, config=_config())
+
+        # The provider does not say which input was too long, so the batch is
+        # halved until that input is alone; every other input is sent whole.
+        assert provider.calls == [
+            batch,
+            ["aaa", _OVER_LIMIT],
+            ["aaa"],
+            [_OVER_LIMIT],
+            [_OVER_LIMIT[:50], _OVER_LIMIT[50:]],
+            ["bbb", "aab"],
+        ]
+        assert [item["index"] for item in result["data"]] == [0, 1, 2, 3]
+        assert [item["embedding"] for item in result["data"]] == [
+            _direction("aaa"),
+            pytest.approx([0.5**0.5, 0.5**0.5]),
+            _direction("bbb"),
+            _direction("aab"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_rejection_without_counts_halves_the_input(self, monkeypatch):
+        provider = self._provider(monkeypatch, _LimitedProvider(80, state_counts=False))
+
+        result = await embeddings({"model": _E5_MODEL, "input": [_OVER_LIMIT]}, config=_config())
+
+        assert provider.calls[1] == [_OVER_LIMIT[:50], _OVER_LIMIT[50:]]
+        assert len(result["data"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_piece_that_is_still_too_long_is_cut_again(self, monkeypatch):
+        # Every token-heavy "z" sits in the second half, so pieces sized by the
+        # overall proportion fit in the first half and overflow in the second.
+        text = ("a" * 9 + " ") * 5 + ("z" * 9 + " ") * 5
+        provider = self._provider(
+            monkeypatch, _LimitedProvider(100, dense=9, vector=lambda _text: [1.0, 0.0])
+        )
+
+        result = await embeddings({"model": _E5_MODEL, "input": [text]}, config=_config())
+
+        assert result["data"][0]["embedding"] == pytest.approx([1.0, 0.0])
+        assert len(result["data"]) == 1
+        # The whole text, then the first set of pieces, then pieces of pieces.
+        assert provider.rejections > 2
+
+    @pytest.mark.asyncio
+    async def test_it_gives_up_after_three_rounds_of_cutting(self, monkeypatch):
+        from services import provider_error_log
+
+        # A limit nothing can meet, so every piece is rejected however small.
+        provider = self._provider(monkeypatch, _LimitedProvider(0))
+
+        with pytest.raises(LlmContextLengthError) as raised:
+            await embeddings({"model": _E5_MODEL, "input": ["one long chunk"]}, config=_config())
+
+        assert raised.value.status_code == 400
+        # One call for the input, then two per round: the pieces, and one of them alone.
+        assert len(provider.calls) == 7
+        assert provider_error_log.latest_failure("watsonx", "embedding") is None
+
+    @pytest.mark.asyncio
+    async def test_the_error_policy_returns_the_rejection_untouched(self, monkeypatch):
+        monkeypatch.setenv("OPENRAG_EMBEDDING_OVERFLOW_POLICY", "error")
+        provider = self._provider(monkeypatch, _LimitedProvider(80))
+
+        with pytest.raises(LlmContextLengthError) as raised:
+            await embeddings({"model": _E5_MODEL, "input": [_OVER_LIMIT]}, config=_config())
+
+        assert provider.calls == [[_OVER_LIMIT]]
+        assert (raised.value.max_tokens, raised.value.requested_tokens) == (80, 100)
+
+    @pytest.mark.asyncio
+    async def test_token_array_inputs_are_not_cut(self, monkeypatch):
+        calls = []
+
+        async def reject(**kwargs):
+            calls.append(kwargs["input"])
+            raise _FakeLiteLLMError(_EMBEDDING_OVERFLOW, status_code=400)
+
+        monkeypatch.setattr("litellm.aembedding", reject)
+
+        with pytest.raises(LlmContextLengthError):
+            await embeddings({"model": _E5_MODEL, "input": [[101, 2023, 102]]}, config=_config())
+
+        assert calls == [[[101, 2023, 102]]]
+
+    @pytest.mark.asyncio
+    async def test_another_failure_among_the_pieces_is_reported_as_itself(self, monkeypatch):
+        from services import provider_error_log
+
+        calls = []
+
+        async def overflow_then_rate_limit(**kwargs):
+            calls.append(kwargs["input"])
+            if len(calls) == 1:
+                raise _FakeLiteLLMError(_EMBEDDING_OVERFLOW, status_code=400)
+            raise _FakeLiteLLMError("rate limit exceeded, retry in 30s", status_code=429)
+
+        monkeypatch.setattr("litellm.aembedding", overflow_then_rate_limit)
+
+        with pytest.raises(LlmGatewayError) as raised:
+            await embeddings({"model": _E5_MODEL, "input": [_OVER_LIMIT]}, config=_config())
+
+        assert (raised.value.status_code, raised.value.code) == (429, "rate_limit_exceeded")
+        assert len(calls) == 2
+        assert "rate limit" in provider_error_log.latest_failure("watsonx", "embedding")
+
+    @pytest.mark.asyncio
+    async def test_a_rejection_it_does_not_recognise_is_left_alone(self, monkeypatch):
+        calls = []
+
+        async def reject(**kwargs):
+            calls.append(kwargs["input"])
+            raise _FakeLiteLLMError("the input is too large for this deployment", status_code=400)
+
+        monkeypatch.setattr("litellm.aembedding", reject)
+
+        with pytest.raises(LlmGatewayError) as raised:
+            await embeddings({"model": _E5_MODEL, "input": [_OVER_LIMIT]}, config=_config())
+
+        assert (raised.value.status_code, raised.value.code) == (502, "upstream_invalid_request")
+        assert len(calls) == 1
+
+    def _onprem(self, monkeypatch, provider):
+        """`provider` behind watsonx on-prem, which takes at most 32 inputs a request."""
+        self._provider(monkeypatch, provider)
+        monkeypatch.setattr(
+            "services.llm_gateway._provider_runtime_kwargs", lambda provider, config: {}
+        )
+        return SimpleNamespace(
+            providers=ProvidersConfig(
+                openai=OpenAIConfig(),
+                anthropic=AnthropicConfig(),
+                watsonx=WatsonXConfig(),
+                ollama=OllamaConfig(),
+                custom={
+                    "watsonx_onprem": GenericProviderConfig(
+                        credentials={
+                            "api_base": "https://cpd.example.com",
+                            "username": "cpduser",
+                            "api_key": "secret",
+                        },
+                        configured=True,
+                    )
+                },
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_overflow_in_a_later_batch_does_not_resend_the_earlier_ones(self, monkeypatch):
+        provider = _LimitedProvider(80)
+        config = self._onprem(monkeypatch, provider)
+        batch = [f"a{index}" for index in range(32)] + [_OVER_LIMIT]
+
+        result = await embeddings(
+            {"model": "watsonx_onprem:ibm/slate-30m-english-rtrvr", "input": batch},
+            config=config,
+        )
+
+        assert provider.calls == [
+            batch[:32],
+            [_OVER_LIMIT],
+            [_OVER_LIMIT[:50], _OVER_LIMIT[50:]],
+        ]
+        assert [item["index"] for item in result["data"]] == list(range(33))
+        assert result["data"][32]["embedding"] == pytest.approx([0.5**0.5, 0.5**0.5])
+        # The 32 that fitted were embedded and billed once.
+        assert result["usage"]["prompt_tokens"] == sum(len(text) for text in batch[:32]) + 100
+
+    @pytest.mark.asyncio
+    async def test_an_input_cut_into_many_pieces_keeps_to_the_batch_size(self, monkeypatch):
+        provider = _LimitedProvider(10)
+        config = self._onprem(monkeypatch, provider)
+        text = "ab " * 133 + "a"
+
+        result = await embeddings(
+            {"model": "watsonx_onprem:ibm/slate-30m-english-rtrvr", "input": [text]},
+            config=config,
+        )
+
+        # 400 tokens against 10 means 48 pieces: sent as 32 and 16, never as 48.
+        assert [len(call) for call in provider.calls] == [1, 32, 16]
+        assert len(result["data"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "policy"),
+    [(None, "average"), ("", "average"), ("average", "average"), (" Error ", "error")],
+)
+def test_embedding_overflow_policy_defaults_to_averaging(monkeypatch, value, policy):
+    from config.settings import embedding_overflow_policy
+
+    if value is None:
+        monkeypatch.delenv("OPENRAG_EMBEDDING_OVERFLOW_POLICY", raising=False)
+    else:
+        monkeypatch.setenv("OPENRAG_EMBEDDING_OVERFLOW_POLICY", value)
+
+    assert embedding_overflow_policy() == policy
+
+
+class TestCuttingAnInputIntoPieces:
+    def test_pieces_are_equal_and_cut_at_whitespace(self):
+        from services.llm_gateway import _split_into_pieces
+
+        text = "word " * 200
+
+        pieces = _split_into_pieces(text, 100, 700)
+
+        # 700 tokens against 100, with headroom: nine pieces, not seven.
+        assert len(pieces) == 9
+        assert "".join(pieces) == text
+        assert all(piece.endswith(" ") for piece in pieces)
+        assert max(map(len, pieces)) - min(map(len, pieces)) <= len(text) // 9 // 5
+
+    def test_a_long_unbroken_run_is_cut_where_it_falls(self):
+        from services.llm_gateway import _split_into_pieces
+
+        assert _split_into_pieces("x" * 100, 80, 100) == ["x" * 50, "x" * 50]
+
+    def test_without_counts_the_text_is_halved(self):
+        from services.llm_gateway import _split_into_pieces
+
+        assert _split_into_pieces(_OVER_LIMIT, None, None) == [_OVER_LIMIT[:50], _OVER_LIMIT[50:]]
+
+    def test_a_text_too_short_to_cut_comes_back_whole(self):
+        from services.llm_gateway import _split_into_pieces
+
+        assert _split_into_pieces("x", 512, 548) == ["x"]
+
+
+class TestAveragingPieceVectors:
+    def test_longer_pieces_weigh_more(self):
+        from services.llm_gateway import _weighted_mean_vector
+
+        mean = _weighted_mean_vector([[1.0, 0.0], [0.0, 1.0]], [3, 1])
+
+        assert mean == pytest.approx([0.9486833, 0.3162278])
+        assert math.hypot(*mean) == pytest.approx(1.0)
+
+    def test_vectors_that_are_not_unit_length_keep_their_scale(self):
+        from services.llm_gateway import _weighted_mean_vector
+
+        # Lengths 3 and 4: the mean is scaled to 3.5, not left at 2.5 or forced to 1.
+        mean = _weighted_mean_vector([[3.0, 0.0], [0.0, 4.0]], [1, 1])
+
+        assert mean == pytest.approx([2.1, 2.8])
+
+    def test_pieces_that_cancel_out_are_left_as_the_zero_vector(self):
+        from services.llm_gateway import _weighted_mean_vector
+
+        assert _weighted_mean_vector([[1.0, 0.0], [-1.0, 0.0]], [1, 1]) == [0.0, 0.0]
+
+
+class TestToolsBesideReasoningEffort:
+    """gpt-5.x refuses function tools next to its own default reasoning effort.
+
+    OpenRAG never sends `reasoning_effort` — OpenAI applies a non-none default
+    to reasoning models and then rejects the pair on /v1/chat/completions,
+    naming an explicit "none" as the fix. `drop_params` cannot help: the
+    parameter is supported, just not in that combination.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self):
+        from services import llm_gateway, provider_error_log
+
+        llm_gateway._TOOLS_NEED_REASONING_OFF.clear()
+        provider_error_log.clear()
+        yield
+        llm_gateway._TOOLS_NEED_REASONING_OFF.clear()
+        provider_error_log.clear()
+
+    @staticmethod
+    def _conflict() -> RuntimeError:
+        return RuntimeError(
+            "OpenAIException - Function tools with reasoning_effort are not supported "
+            "for gpt-5.6-luna in /v1/chat/completions. To use function tools, use "
+            "/v1/responses or set reasoning_effort to 'none'."
+        )
+
+    def _wire(self, monkeypatch, model="gpt-5.6-luna", supports_none=True):
+        from services import llm_gateway
+
+        monkeypatch.setattr(llm_gateway, "resolve_call", lambda *a, **k: (model, "openai", {}))
+        monkeypatch.setattr(
+            llm_gateway,
+            "_model_info",
+            # Takes the logical provider too: a model routed under a transport
+            # alias has no row under the transport id, so lookups pass the
+            # provider key alongside it.
+            lambda _m, _provider=None: {"supports_none_reasoning_effort": supports_none},
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_call_is_retried_with_reasoning_off(self, monkeypatch):
+        from services import llm_gateway
+
+        self._wire(monkeypatch)
+        calls = []
+
+        async def _flaky(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise self._conflict()
+            return {"choices": [{"message": {"content": "hi"}}]}
+
+        monkeypatch.setattr("litellm.acompletion", _flaky)
+
+        await llm_gateway.chat_completions(
+            {"model": "gpt-5.6-luna", "messages": [], "tools": [{"type": "function"}]}
+        )
+
+        assert len(calls) == 2
+        assert "reasoning_effort" not in calls[0]
+        assert calls[1]["reasoning_effort"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_the_next_call_does_not_pay_for_the_lesson_again(self, monkeypatch):
+        from services import llm_gateway
+
+        self._wire(monkeypatch)
+        calls = []
+
+        async def _flaky(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise self._conflict()
+            return {"choices": [{"message": {"content": "hi"}}]}
+
+        monkeypatch.setattr("litellm.acompletion", _flaky)
+        body = {"model": "gpt-5.6-luna", "messages": [], "tools": [{"type": "function"}]}
+
+        await llm_gateway.chat_completions(dict(body))
+        await llm_gateway.chat_completions(dict(body))
+
+        assert len(calls) == 3
+        assert calls[2]["reasoning_effort"] == "none"
+
+    @pytest.mark.asyncio
+    async def test_an_effort_the_caller_chose_is_never_overridden(self, monkeypatch):
+        """Silently disabling reasoning someone asked for is worse than the error."""
+        from services import llm_gateway
+
+        self._wire(monkeypatch)
+        monkeypatch.setattr(
+            llm_gateway,
+            "_LITELLM_FORWARDED_PARAMS",
+            (*llm_gateway._LITELLM_FORWARDED_PARAMS, "reasoning_effort"),
+        )
+        calls = []
+
+        async def _always_fails(**kwargs):
+            calls.append(kwargs)
+            raise self._conflict()
+
+        monkeypatch.setattr("litellm.acompletion", _always_fails)
+
+        with pytest.raises(llm_gateway.LlmGatewayError):
+            await llm_gateway.chat_completions(
+                {
+                    "model": "gpt-5.6-luna",
+                    "messages": [],
+                    "tools": [{"type": "function"}],
+                    "reasoning_effort": "high",
+                }
+            )
+
+        assert len(calls) == 1
+        assert calls[0]["reasoning_effort"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_a_model_that_cannot_take_none_reports_the_error(self, monkeypatch):
+        """Nothing to retry with — only the Responses API can serve tools there."""
+        from services import llm_gateway
+
+        self._wire(monkeypatch, supports_none=False)
+        calls = []
+
+        async def _always_fails(**kwargs):
+            calls.append(kwargs)
+            raise self._conflict()
+
+        monkeypatch.setattr("litellm.acompletion", _always_fails)
+
+        with pytest.raises(llm_gateway.LlmGatewayError):
+            await llm_gateway.chat_completions(
+                {"model": "gpt-5.6-luna", "messages": [], "tools": [{"type": "function"}]}
+            )
+
+        # Raised on the first attempt: there is no second value to try.
+        assert len(calls) == 1
+        assert "reasoning_effort" not in calls[0]
+
+    @pytest.mark.asyncio
+    async def test_an_unrelated_failure_is_not_retried(self, monkeypatch):
+        from services import llm_gateway
+
+        self._wire(monkeypatch)
+        calls = []
+
+        async def _no_credits(**kwargs):
+            calls.append(kwargs)
+            raise RuntimeError("You have no credits remaining.")
+
+        monkeypatch.setattr("litellm.acompletion", _no_credits)
+
+        with pytest.raises(llm_gateway.LlmGatewayError):
+            await llm_gateway.chat_completions(
+                {"model": "gpt-5.6-luna", "messages": [], "tools": [{"type": "function"}]}
+            )
+
+        assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tracing metadata: what each call tells Langfuse (only when tracing is on)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tracing_on(monkeypatch):
+    from observability import tracing
+
+    monkeypatch.setattr(tracing, "_enabled", True)
+
+
+def _capture_embedding(monkeypatch) -> list[dict]:
+    calls: list[dict] = []
+
+    async def fake_aembedding(**kwargs):
+        calls.append(kwargs)
+        return {
+            "object": "list",
+            "data": [{"embedding": [0.1], "index": i} for i in range(len(kwargs["input"]))],
+        }
+
+    monkeypatch.setattr("litellm.aembedding", fake_aembedding)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_embeddings_send_no_tracing_metadata_when_tracing_is_off(monkeypatch):
+    from observability import tracing
+
+    monkeypatch.setattr(tracing, "_enabled", False)
+    calls = _capture_embedding(monkeypatch)
+
+    await embeddings({"model": "text-embedding-3-small", "input": ["hello"]}, config=_config())
+
+    assert "metadata" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_bulk_embeddings_are_traced_as_ingest_with_sizes(monkeypatch, tracing_on):
+    calls = _capture_embedding(monkeypatch)
+
+    await embeddings(
+        {"model": "text-embedding-3-small", "input": ["hello", "world!"]}, config=_config()
+    )
+
+    metadata = calls[0]["metadata"]
+    assert metadata["generation_name"] == "embedding.ingest"
+    assert metadata["trace_metadata"]["openrag.provider"] == "openai"
+    assert metadata["trace_metadata"]["openrag.embedding.inputs"] == 2
+    assert metadata["trace_metadata"]["openrag.embedding.input_chars"] == 11
+
+
+@pytest.mark.asyncio
+async def test_interactive_embeddings_are_traced_as_query(monkeypatch, tracing_on):
+    calls = _capture_embedding(monkeypatch)
+
+    await embeddings(
+        {"model": "text-embedding-3-small", "input": "what is openrag"},
+        config=_config(),
+        interactive=True,
+    )
+
+    metadata = calls[0]["metadata"]
+    assert metadata["generation_name"] == "embedding.query"
+    assert metadata["trace_metadata"]["openrag.embedding.inputs"] == 1
+    assert metadata["trace_metadata"]["openrag.embedding.input_chars"] == 15
+
+
+@pytest.mark.asyncio
+async def test_embedding_trace_metadata_never_carries_the_input_text(monkeypatch, tracing_on):
+    calls = _capture_embedding(monkeypatch)
+
+    await embeddings(
+        {"model": "text-embedding-3-small", "input": ["secret chunk text"]}, config=_config()
+    )
+
+    assert "secret chunk text" not in json.dumps(calls[0]["metadata"])
+
+
+@pytest.mark.asyncio
+async def test_onprem_sub_batches_are_numbered_in_trace_metadata(monkeypatch, tracing_on):
+    providers = ProvidersConfig(
+        openai=OpenAIConfig(),
+        anthropic=AnthropicConfig(),
+        watsonx=WatsonXConfig(),
+        ollama=OllamaConfig(),
+        custom={
+            "watsonx_onprem": GenericProviderConfig(
+                credentials={
+                    "api_base": "https://cpd.example.com",
+                    "username": "cpduser",
+                    "api_key": "secret",
+                },
+                configured=True,
+            )
+        },
+    )
+    calls = _capture_embedding(monkeypatch)
+    monkeypatch.setattr(
+        "services.llm_gateway._provider_runtime_kwargs",
+        lambda provider, config: {},
+    )
+
+    await embeddings(
+        {
+            "model": "watsonx_onprem:ibm/slate-30m-english-rtrvr",
+            "input": [f"chunk-{index}" for index in range(70)],
+        },
+        config=SimpleNamespace(providers=providers),
+    )
+
+    traced = [call["metadata"]["trace_metadata"] for call in calls]
+    assert [t["openrag.embedding.inputs"] for t in traced] == [32, 32, 6]
+    assert [t["openrag.embedding.sub_batch"] for t in traced] == [1, 2, 3]
+    assert {t["openrag.embedding.sub_batches"] for t in traced} == {3}
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_are_traced_with_request_shape(monkeypatch, tracing_on):
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+        return {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+
+    await chat_completions(
+        {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hello"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "search", "parameters": {}}}],
+        },
+        config=_config(),
+    )
+
+    metadata = captured["metadata"]
+    assert metadata["generation_name"] == "chat.completion"
+    assert metadata["trace_metadata"]["openrag.provider"] == "openai"
+    assert metadata["trace_metadata"]["openrag.chat.messages"] == 2
+    assert metadata["trace_metadata"]["openrag.chat.tools"] == 1
+    assert metadata["trace_metadata"]["openrag.chat.stream"] is False
+    assert "hello" not in json.dumps(metadata)

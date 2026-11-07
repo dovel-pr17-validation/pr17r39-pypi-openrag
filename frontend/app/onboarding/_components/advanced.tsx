@@ -1,0 +1,76 @@
+import { LabelWrapper } from "@/components/label-wrapper";
+import { ModelSelector } from "@/components/models/model-selector";
+
+export function AdvancedOnboarding({
+  icon,
+  languageModels,
+  embeddingModels,
+  languageModel,
+  embeddingModel,
+  searchPlaceholder,
+  setLanguageModel,
+  setEmbeddingModel,
+}: {
+  icon?: React.ReactNode;
+  languageModels?: { value: string; label: string }[];
+  embeddingModels?: { value: string; label: string }[];
+  languageModel?: string;
+  embeddingModel?: string;
+  searchPlaceholder?: string;
+  setLanguageModel?: (model: string) => void;
+  setEmbeddingModel?: (model: string) => void;
+}) {
+  const hasEmbeddingModels =
+    embeddingModels !== undefined &&
+    embeddingModel !== undefined &&
+    setEmbeddingModel !== undefined;
+  const hasLanguageModels =
+    languageModels !== undefined &&
+    languageModel !== undefined &&
+    setLanguageModel !== undefined;
+
+  return (
+    <div className="space-y-6">
+      {hasEmbeddingModels && (
+        <LabelWrapper
+          label="Embedding model"
+          helperText="Model used for knowledge ingest and retrieval"
+          id="embedding-model"
+          required={true}
+        >
+          <ModelSelector
+            options={embeddingModels}
+            custom
+            previewLimit={5}
+            searchPlaceholder={searchPlaceholder}
+            data-testid="embedding-model-selector"
+            aria-label="Embedding model"
+            icon={icon}
+            value={embeddingModel}
+            onValueChange={setEmbeddingModel}
+          />
+        </LabelWrapper>
+      )}
+      {hasLanguageModels && (
+        <LabelWrapper
+          label="Language model"
+          helperText="Model used for chat"
+          id="embedding-model"
+          required={true}
+        >
+          <ModelSelector
+            options={languageModels}
+            custom
+            previewLimit={5}
+            searchPlaceholder={searchPlaceholder}
+            data-testid="language-model-selector"
+            aria-label="Language model"
+            icon={icon}
+            value={languageModel}
+            onValueChange={setLanguageModel}
+          />
+        </LabelWrapper>
+      )}
+    </div>
+  );
+}

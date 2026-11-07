@@ -1,0 +1,952 @@
+"""
+Unit tests for TaskService.get_task_status2 and its supporting helpers.
+
+Tests verify that:
+- Failed file entries receive structured failure metadata (component,
+  failure_phase, user_facing_message, actionable_by) when the cause is known.
+- Non-failed entries (completed, running, pending) are never decorated.
+- Unknown failures produce no extra fields.
+- get_task_status (the existing method) is unaffected by the refactor.
+"""
+
+from unittest.mock import Mock
+
+import pytest
+
+from models.tasks import DoclingPhaseStatus, FileTask, IngestionPhase, TaskStatus, UploadTask
+from services.task_service import TaskService, _opensearch_failure_metadata
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def task_service():
+    return TaskService(document_service=Mock(), ingestion_timeout=2)
+
+
+def _make_upload_task(task_id: str, file_tasks: dict[str, FileTask]) -> UploadTask:
+    return UploadTask(task_id=task_id, total_files=len(file_tasks), file_tasks=file_tasks)
+
+
+def _make_file_task(
+    *,
+    file_path: str = "test.pdf",
+    status: TaskStatus = TaskStatus.FAILED,
+    phase: IngestionPhase = IngestionPhase.DOCLING,
+    docling_status: DoclingPhaseStatus = DoclingPhaseStatus.PENDING,
+    error: str | None = None,
+    filename: str | None = "test.pdf",
+) -> FileTask:
+    ft = FileTask(file_path=file_path, filename=filename)
+    ft.status = status
+    ft.phase = phase
+    ft.docling_status = docling_status
+    ft.error = error
+    return ft
+
+
+def _store_task(task_service: TaskService, user_id: str, upload_task: UploadTask) -> None:
+    task_service.task_store.setdefault(user_id, {})[upload_task.task_id] = upload_task
+
+
+# ---------------------------------------------------------------------------
+# _infer_failure_metadata
+# ---------------------------------------------------------------------------
+
+
+class TestInferFailureMetadata:
+    def test_upload_size_error_while_docling_is_still_pending(self, task_service):
+        message = (
+            '"report.pdf" (1.9 MB) was rejected by '
+            "https://docling-serve:5001/v1/convert/file/async with HTTP 413. "
+            "Raise that limit (nginx: client_max_body_size), or set "
+            "OPENRAG_MAX_UPLOAD_MB to the proxy's real limit."
+        )
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PENDING,
+            error=f"Docling upload failed: {message}",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "docling"
+        assert meta["failure_phase"] == "parsing"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert meta["user_facing_message"].startswith('"report.pdf" is 1.9 MB.')
+        assert "document-processing service" in meta["user_facing_message"]
+        assert "within the configured upload limit" in meta["user_facing_message"]
+        assert "OPENRAG_MAX_UPLOAD_MB" in meta["user_facing_message"]
+        assert "docling-serve" not in meta["user_facing_message"]
+        assert "client_max_body_size" not in meta["user_facing_message"]
+
+    def test_docling_failed_status(self, task_service):
+        ft = _make_file_task(docling_status=DoclingPhaseStatus.FAILED)
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "docling"
+        assert meta["failure_phase"] == "parsing"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert meta["user_facing_message"]
+
+    def test_docling_expired_status(self, task_service):
+        ft = _make_file_task(docling_status=DoclingPhaseStatus.EXPIRED)
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "docling"
+        assert meta["failure_phase"] == "parsing"
+        assert meta["actionable_by"] == "RETRYABLE"
+        assert meta["user_facing_message"]
+
+    def test_docling_timeout_via_error_string(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PENDING,
+            error="Docling conversion did not complete (timeout): polling exceeded 300s",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "docling"
+        assert meta["failure_phase"] == "parsing"
+        assert meta["actionable_by"] == "RETRYABLE"
+
+    def test_docling_polling_timeout_sets_failed_status(self, task_service):
+        """Backend polling marks TIMEOUT as docling_status=FAILED; still retryable."""
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.FAILED,
+            error=(
+                "Docling conversion did not complete (timeout): Docling polling timed out after 10s"
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["actionable_by"] == "RETRYABLE"
+
+    def test_docling_conversion_failed_not_retryable(self, task_service):
+        """Permanent conversion failure (e.g. corrupt file) is not retryable."""
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.FAILED,
+            error=("Docling conversion did not complete (failed): Docling reported failure"),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+
+    def test_corrupt_docx_bad_zip_not_retryable(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.FAILED,
+            error=(
+                "Docling conversion did not complete (failed): BadZipFile: File is not a zip file"
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+
+    def test_password_protected_pdf_maps_to_clean_message(self, task_service):
+        ft = _make_file_task(
+            docling_status=DoclingPhaseStatus.FAILED,
+            error=(
+                "Docling conversion did not complete (failed): "
+                "Docling result unavailable after SUCCESS status: Docling processing "
+                "failed: docling-parse could not load document "
+                "cbfc231c73e85df69b34cfa56b4bb0696dc0f10d0536bcca821f92c324041bac: "
+                "Failed to load document (PDFium: Incorrect password error)."
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert meta["component"] == "docling"
+        assert meta["failure_phase"] == "parsing"
+        msg = meta["user_facing_message"]
+        assert "password-protected" in msg.lower()
+        assert "not supported" in msg.lower()
+        assert "remove the password" in msg.lower()
+        assert "upload the pdf again" in msg.lower()
+        # no internals leaked
+        assert "pdfium" not in msg.lower()
+        assert "docling-parse" not in msg.lower()
+        assert "cbfc231c" not in msg
+
+    def test_password_protected_pdf_non_langflow_path_maps_to_clean_message(self, task_service):
+        """The non-Langflow path stores DoclingService's error verbatim.
+
+        Unlike the Langflow path above there is no "did not complete" /
+        "result unavailable" wrapper — the string is exactly what
+        DoclingService._poll_result raises once the result body's errors are
+        surfaced. It must map to the same user-facing password message.
+        """
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PENDING,
+            error=(
+                "Docling processing failed: docling-parse could not load document "
+                "cbfc231c73e85df69b34cfa56b4bb0696dc0f10d0536bcca821f92c324041bac: "
+                "Failed to load document (PDFium: Incorrect password error)."
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert meta["component"] == "docling"
+        assert meta["failure_phase"] == "parsing"
+        msg = meta["user_facing_message"]
+        assert "password-protected" in msg.lower()
+        assert "remove the password" in msg.lower()
+        # no internals leaked
+        assert "pdfium" not in msg.lower()
+        assert "docling-parse" not in msg.lower()
+        assert "cbfc231c" not in msg
+
+    def test_langflow_empty_content_not_retryable(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error="No text content could be extracted from document",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+
+    def test_image_without_text_prompts_user_to_enable_ocr(self, task_service):
+        ft = _make_file_task(
+            file_path="scan.png",
+            filename="scan.png",
+            error="No text content could be extracted from document",
+        )
+
+        meta = task_service._infer_failure_metadata(ft)
+
+        assert meta is not None
+        assert meta["actionable_by"] == "RETRYABLE"
+        assert meta["user_facing_message"] == (
+            "No text content could be extracted from this image file. "
+            "Enable OCR in Settings > Knowledge Base and retry ingestion."
+        )
+
+    def test_docling_phase_still_processing(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PROCESSING,
+            error="some generic failure",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "docling"
+        assert meta["failure_phase"] == "parsing"
+        assert meta["actionable_by"] == "RETRYABLE"
+
+    def test_task_cancelled_by_user_not_retryable(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PROCESSING,
+            error="Task cancelled by user",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert "component" not in meta
+        assert meta["failure_phase"] == "cancelled"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert meta["user_facing_message"] == "Ingestion was cancelled."
+
+    def test_langflow_phase_failure(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error="Langflow run timed out",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "langflow"
+        assert meta["failure_phase"] == "unknown"
+        assert meta["actionable_by"] == "RETRYABLE"
+
+    def test_langflow_model_not_found_surfaces_specific_message(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error=(
+                "Model 'ibm/granite-4-h-small' was not found. "
+                "This model may be unsupported, deprecated, or removed."
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "langflow"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert "granite-4-h-small" in meta["user_facing_message"]
+        assert "unexpectedly" not in meta["user_facing_message"].lower()
+
+    def test_langflow_azure_deployment_missing_is_user_actionable(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error="The API deployment for this resource does not exist.",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "langflow"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert meta["user_facing_message"] == (
+            "The API deployment for this resource does not exist."
+        )
+
+    def test_langflow_revoked_api_key_failure(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error=(
+                'Failed to authenticate with IBM Watson: {"errorCode":"BXNIM0415E",'
+                '"errorMessage":"Provided API key could not be found."}'
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "openrag"
+        assert meta["failure_phase"] == "embedding"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert "API key" in meta["user_facing_message"]
+        assert "{" not in meta["user_facing_message"]
+
+    def test_langflow_disabled_api_key_failure(self, task_service):
+        """Disabled (not deleted) IBM keys must not fall through to generic Langflow copy."""
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error=(
+                "Error building Component Embedding Model: Failed to initialize IBM "
+                "WatsonX embedding model: Attempt of authenticating connection to "
+                "service failed, please validate your credentials. Error: "
+                '{"errorCode":"BXNIM0420E","errorMessage":"Provided API key is disabled."}'
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "openrag"
+        assert meta["failure_phase"] == "embedding"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+        assert "disabled" in meta["user_facing_message"].lower()
+        assert "unexpectedly" not in meta["user_facing_message"].lower()
+        assert "error building component" not in meta["user_facing_message"].lower()
+        assert "error running graph" not in meta["user_facing_message"].lower()
+        assert "{" not in meta["user_facing_message"]
+
+    def test_chunk_too_long_for_the_embedding_model_is_user_actionable(self, task_service):
+        """Retrying resends the same chunk, so RETRYABLE would be a false promise."""
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error=(
+                "watsonx/intfloat/multilingual-e5-large: Invalid input argument for Model "
+                "'intfloat/multilingual-e5-large': This model's maximum context length is 512 "
+                "tokens. However, you requested 548 tokens in the input for embedding generation."
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta == {
+            "component": "openrag",
+            "failure_phase": "embedding",
+            "user_facing_message": (
+                "A section of this document is longer than the embedding model accepts "
+                "(548 tokens; the limit is 512). Try a smaller chunk size or an embedding "
+                "model with a larger input limit, then retry ingestion."
+            ),
+            "actionable_by": "USER_ACTIONABLE",
+        }
+
+    @pytest.mark.parametrize(
+        ("error", "size"),
+        [
+            ("This model's maximum context length is 512 tokens.", " (the limit is 512 tokens)"),
+            ("Error code: 400 - {'error': {'code': 'context_length_exceeded'}}", ""),
+        ],
+    )
+    def test_chunk_too_long_states_only_the_counts_the_provider_gave(
+        self, task_service, error, size
+    ):
+        """Report embedding overflow as actionable using only known token counts."""
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW, docling_status=DoclingPhaseStatus.SUCCESS, error=error
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta["user_facing_message"].startswith(
+            f"A section of this document is longer than the embedding model accepts{size}. "
+        )
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+
+    def test_langflow_disconnect_with_api_key_text_prefers_credentials(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error=("Server disconnected without sending a response. Incorrect API key provided"),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["failure_phase"] == "embedding"
+        assert "API key" in meta["user_facing_message"]
+        assert "connection was lost" not in meta["user_facing_message"].lower()
+
+    def test_duplicate_file_error(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PENDING,
+            error="File with name 'report.pdf' already exists",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "openrag"
+        assert meta["failure_phase"] == "file_validation"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+
+    def test_langflow_duplicate_file_error_prefers_file_validation(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error="File with name 'report.pdf' already exists",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "openrag"
+        assert meta["failure_phase"] == "file_validation"
+        assert meta["actionable_by"] == "USER_ACTIONABLE"
+
+    def test_unknown_failure_returns_none(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PENDING,
+            error="some completely unknown error",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is None
+
+    def test_no_error_string_unknown_phase(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PENDING,
+            error=None,
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is None
+
+
+# ---------------------------------------------------------------------------
+# get_task_status2 — task not found
+# ---------------------------------------------------------------------------
+
+
+class TestGetTaskStatus2NotFound:
+    def test_missing_task_id_returns_none(self, task_service):
+        assert task_service.get_task_status2("user1", "") is None
+
+    def test_unknown_task_id_returns_none(self, task_service):
+        assert task_service.get_task_status2("user1", "does-not-exist") is None
+
+
+# ---------------------------------------------------------------------------
+# get_task_status2 — failure metadata on failed files
+# ---------------------------------------------------------------------------
+
+
+class TestGetTaskStatus2FailureMetadata:
+    def test_docling_failed_adds_metadata(self, task_service):
+        ft = _make_file_task(
+            docling_status=DoclingPhaseStatus.FAILED,
+            error="Docling conversion did not complete (failed): Docling reported failure",
+        )
+        task = _make_upload_task("t1", {"test.pdf": ft})
+        task.status = TaskStatus.FAILED
+        task.failed_files = 1
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status2("user1", "t1")
+        file_entry = result["files"]["test.pdf"]
+
+        assert file_entry["status"] == "failed"
+        assert file_entry["component"] == "docling"
+        assert file_entry["failure_phase"] == "parsing"
+        assert file_entry["actionable_by"] == "USER_ACTIONABLE"
+        assert file_entry["user_facing_message"]
+
+    def test_docling_expired_adds_metadata(self, task_service):
+        ft = _make_file_task(docling_status=DoclingPhaseStatus.EXPIRED)
+        task = _make_upload_task("t2", {"test.pdf": ft})
+        task.status = TaskStatus.FAILED
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status2("user1", "t2")
+        file_entry = result["files"]["test.pdf"]
+
+        assert file_entry["component"] == "docling"
+        assert file_entry["failure_phase"] == "parsing"
+        assert file_entry["actionable_by"] == "RETRYABLE"
+
+    def test_langflow_failure_adds_metadata(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error="Langflow run failed",
+        )
+        task = _make_upload_task("t3", {"doc.pdf": ft})
+        task.status = TaskStatus.FAILED
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status2("user1", "t3")
+        file_entry = result["files"]["doc.pdf"]
+
+        assert file_entry["component"] == "langflow"
+        assert file_entry["failure_phase"] == "unknown"
+        assert file_entry["actionable_by"] == "RETRYABLE"
+        assert file_entry["user_facing_message"] == "Langflow run failed"
+
+    def test_duplicate_file_failure_adds_metadata(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PENDING,
+            error="File with name 'report.pdf' already exists",
+        )
+        task = _make_upload_task("t4", {"report.pdf": ft})
+        task.status = TaskStatus.FAILED
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status2("user1", "t4")
+        file_entry = result["files"]["report.pdf"]
+
+        assert file_entry["component"] == "openrag"
+        assert file_entry["failure_phase"] == "file_validation"
+        assert file_entry["actionable_by"] == "USER_ACTIONABLE"
+
+    def test_unknown_failure_adds_no_metadata_fields(self, task_service):
+        ft = _make_file_task(
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PENDING,
+            error="some unrecognised error",
+        )
+        task = _make_upload_task("t5", {"doc.pdf": ft})
+        task.status = TaskStatus.FAILED
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status2("user1", "t5")
+        file_entry = result["files"]["doc.pdf"]
+
+        assert "component" not in file_entry
+        assert "failure_phase" not in file_entry
+        assert "user_facing_message" not in file_entry
+        assert "actionable_by" not in file_entry
+
+
+# ---------------------------------------------------------------------------
+# get_task_status2 — non-failed files get no metadata
+# ---------------------------------------------------------------------------
+
+
+class TestGetTaskStatus2NonFailedFiles:
+    def test_completed_file_has_no_metadata(self, task_service):
+        ft = _make_file_task(status=TaskStatus.COMPLETED, phase=IngestionPhase.COMPLETE)
+        ft.docling_status = DoclingPhaseStatus.SUCCESS
+        ft.error = None
+        task = _make_upload_task("t6", {"doc.pdf": ft})
+        task.status = TaskStatus.COMPLETED
+        task.successful_files = 1
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status2("user1", "t6")
+        file_entry = result["files"]["doc.pdf"]
+
+        assert "component" not in file_entry
+        assert "failure_phase" not in file_entry
+        assert "user_facing_message" not in file_entry
+        assert "actionable_by" not in file_entry
+
+    def test_running_file_has_no_metadata(self, task_service):
+        ft = _make_file_task(
+            status=TaskStatus.RUNNING,
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PROCESSING,
+            error=None,
+        )
+        task = _make_upload_task("t7", {"doc.pdf": ft})
+        task.status = TaskStatus.RUNNING
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status2("user1", "t7")
+        file_entry = result["files"]["doc.pdf"]
+
+        assert "component" not in file_entry
+        assert "failure_phase" not in file_entry
+
+    def test_pending_file_has_no_metadata(self, task_service):
+        ft = _make_file_task(status=TaskStatus.PENDING, error=None)
+        task = _make_upload_task("t8", {"doc.pdf": ft})
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status2("user1", "t8")
+        file_entry = result["files"]["doc.pdf"]
+
+        assert "component" not in file_entry
+        assert "failure_phase" not in file_entry
+
+
+# ---------------------------------------------------------------------------
+# get_task_status2 — mixed files
+# ---------------------------------------------------------------------------
+
+
+class TestGetTaskStatus2Mixed:
+    def test_only_failed_files_get_metadata(self, task_service):
+        failed_ft = _make_file_task(
+            file_path="bad.pdf",
+            filename="bad.pdf",
+            docling_status=DoclingPhaseStatus.FAILED,
+            error="Docling conversion did not complete (failed): Docling reported failure",
+        )
+        ok_ft = _make_file_task(
+            file_path="good.pdf",
+            filename="good.pdf",
+            status=TaskStatus.COMPLETED,
+            phase=IngestionPhase.COMPLETE,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error=None,
+        )
+        running_ft = _make_file_task(
+            file_path="wip.pdf",
+            filename="wip.pdf",
+            status=TaskStatus.RUNNING,
+            phase=IngestionPhase.DOCLING,
+            docling_status=DoclingPhaseStatus.PROCESSING,
+            error=None,
+        )
+        task = _make_upload_task(
+            "t9", {"bad.pdf": failed_ft, "good.pdf": ok_ft, "wip.pdf": running_ft}
+        )
+        task.status = TaskStatus.RUNNING
+        task.successful_files = 1
+        task.failed_files = 1
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status2("user1", "t9")
+
+        bad = result["files"]["bad.pdf"]
+        assert bad["component"] == "docling"
+        assert bad["failure_phase"] == "parsing"
+
+        good = result["files"]["good.pdf"]
+        assert "component" not in good
+
+        wip = result["files"]["wip.pdf"]
+        assert "component" not in wip
+
+    def test_top_level_fields_present(self, task_service):
+        ft = _make_file_task(docling_status=DoclingPhaseStatus.FAILED)
+        task = _make_upload_task("t10", {"doc.pdf": ft})
+        task.status = TaskStatus.FAILED
+        task.failed_files = 1
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status2("user1", "t10")
+
+        for key in (
+            "task_id",
+            "status",
+            "total_files",
+            "processed_files",
+            "successful_files",
+            "failed_files",
+            "running_files",
+            "pending_files",
+            "created_at",
+            "updated_at",
+            "duration_seconds",
+            "files",
+        ):
+            assert key in result, f"missing key: {key}"
+
+
+# ---------------------------------------------------------------------------
+# get_task_status2 — anonymous user fallback
+# ---------------------------------------------------------------------------
+
+
+class TestGetTaskStatus2AnonymousFallback:
+    def test_resolves_anonymous_task(self, task_service):
+        from session_manager import AnonymousUser
+
+        ft = _make_file_task(docling_status=DoclingPhaseStatus.FAILED)
+        task = _make_upload_task("anon-task", {"doc.pdf": ft})
+        task.status = TaskStatus.FAILED
+        anon_id = AnonymousUser().user_id
+        task_service.task_store[anon_id] = {"anon-task": task}
+
+        result = task_service.get_task_status2("some-other-user", "anon-task")
+        assert result is not None
+        assert result["task_id"] == "anon-task"
+        assert result["files"]["doc.pdf"]["component"] == "docling"
+
+
+# ---------------------------------------------------------------------------
+# Regression: get_task_status remains unchanged
+# ---------------------------------------------------------------------------
+
+
+class TestGetTaskStatusRegression:
+    def test_no_metadata_fields_in_original_method(self, task_service):
+        ft = _make_file_task(
+            docling_status=DoclingPhaseStatus.FAILED,
+            error="Docling conversion did not complete (failed): Docling reported failure",
+        )
+        task = _make_upload_task("reg1", {"doc.pdf": ft})
+        task.status = TaskStatus.FAILED
+        task.failed_files = 1
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status("user1", "reg1")
+        file_entry = result["files"]["doc.pdf"]
+
+        assert file_entry["status"] == "failed"
+        assert "component" not in file_entry
+        assert "failure_phase" not in file_entry
+        assert "user_facing_message" not in file_entry
+        assert "actionable_by" not in file_entry
+
+    def test_original_method_baseline_shape_unchanged(self, task_service):
+        ft = _make_file_task(
+            status=TaskStatus.COMPLETED,
+            phase=IngestionPhase.COMPLETE,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error=None,
+        )
+        task = _make_upload_task("reg2", {"doc.pdf": ft})
+        task.status = TaskStatus.COMPLETED
+        task.successful_files = 1
+        _store_task(task_service, "user1", task)
+
+        result = task_service.get_task_status("user1", "reg2")
+        file_entry = result["files"]["doc.pdf"]
+
+        expected_keys = {
+            "status",
+            "result",
+            "error",
+            "retry_count",
+            "created_at",
+            "updated_at",
+            "duration_seconds",
+            "filename",
+            "phase",
+            "docling_status",
+            "docling_task_id",
+        }
+        assert set(file_entry.keys()) == expected_keys
+
+    def test_both_methods_return_same_baseline_for_failed_file(self, task_service):
+        """get_task_status2 must include all fields from get_task_status plus any extras."""
+        ft = _make_file_task(
+            docling_status=DoclingPhaseStatus.FAILED,
+            error="Docling conversion did not complete (failed): Docling reported failure",
+        )
+        task = _make_upload_task("reg3", {"doc.pdf": ft})
+        task.status = TaskStatus.FAILED
+        task.failed_files = 1
+        _store_task(task_service, "user1", task)
+
+        v1 = task_service.get_task_status("user1", "reg3")
+        v2 = task_service.get_task_status2("user1", "reg3")
+
+        # All v1 top-level keys must appear in v2
+        for key in v1:
+            assert key in v2, f"get_task_status2 missing top-level key: {key}"
+            if key != "files":
+                assert v1[key] == v2[key], f"top-level key '{key}' differs"
+
+        # All baseline file entry keys must survive in get_task_status2
+        v1_file = v1["files"]["doc.pdf"]
+        v2_file = v2["files"]["doc.pdf"]
+        for key in v1_file:
+            assert key in v2_file, f"get_task_status2 file entry missing key: {key}"
+            assert v1_file[key] == v2_file[key], f"file entry key '{key}' differs"
+
+
+# ---------------------------------------------------------------------------
+# OpenSearch transport failures
+# ---------------------------------------------------------------------------
+
+
+class TestOpenSearchFailureMetadata:
+    def test_by_query_conflict_is_classified_as_retryable_opensearch_failure(self, task_service):
+        # opensearch-py puts the entire by-query response body into the message,
+        # because that response has no top-level "error" key to use instead.
+        ft = _make_file_task(
+            filename="logo.png",
+            phase=IngestionPhase.LANGFLOW,
+            error=(
+                'ConflictError(409, \'{"took":2719,"timed_out":false,"total":300,'
+                '"updated":19,"version_conflicts":1,"failures":[{"index":"documents",'
+                '"id":"20","cause":{"type":"version_conflict_engine_exception"}}]}\')'
+            ),
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "opensearch"
+        assert meta["failure_phase"] == "indexing"
+        assert meta["actionable_by"] == "RETRYABLE"
+        msg = meta["user_facing_message"]
+        assert "retry ingestion" in msg.lower()
+        # The raw payload must not reach the UI.
+        assert "version_conflict_engine_exception" not in msg
+        assert "{" not in msg
+
+    def test_mapper_parsing_body_is_not_read_as_a_corrupt_file(self, task_service):
+        # A 400 body contains the substring "failed to parse", which
+        # _is_non_retryable_file_error would otherwise classify as a corrupt file.
+        ft = _make_file_task(
+            error="RequestError(400, 'mapper_parsing_exception', 'failed to parse field [x]')"
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "opensearch"
+        assert "corrupt" not in meta["user_facing_message"].lower()
+
+    def test_image_without_text_still_gets_the_ocr_guidance(self, task_service):
+        ft = _make_file_task(
+            filename="scan.png",
+            phase=IngestionPhase.LANGFLOW,
+            docling_status=DoclingPhaseStatus.SUCCESS,
+            error="No text content could be extracted from document",
+        )
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "docling"
+        assert "ocr" in meta["user_facing_message"].lower()
+
+    def test_plain_errors_are_left_to_the_existing_branches(self, task_service):
+        ft = _make_file_task(error="Docling conversion did not complete (timeout): 300s")
+        meta = task_service._infer_failure_metadata(ft)
+        assert meta is not None
+        assert meta["component"] == "docling"
+
+
+class TestOpenSearchErrorStringContract:
+    """Pin the opensearch-py rendering the classifier depends on.
+
+    _opensearch_failure_metadata matches the exception's *string form*, which is
+    built by opensearch-py's Connection._raise_error, not by us. If a client
+    upgrade changes that rendering, the classifier silently stops matching and
+    users start seeing raw payloads again. These tests fail loudly instead of
+    letting that regress quietly.
+    """
+
+    def test_by_query_conflict_renders_body_as_the_message(self):
+        from opensearchpy.connection.base import Connection
+        from opensearchpy.exceptions import ConflictError
+
+        # An _update_by_query 409 carries no top-level "error" key, so
+        # _raise_error falls back to using the whole response body as the message.
+        body = (
+            '{"took":12,"timed_out":false,"total":3,"updated":1,'
+            '"version_conflicts":1,"failures":[{"index":"documents","id":"7",'
+            '"cause":{"type":"version_conflict_engine_exception"}}]}'
+        )
+        with pytest.raises(ConflictError) as excinfo:
+            Connection()._raise_error(409, body, "application/json")
+
+        rendered = str(excinfo.value)
+        assert rendered.startswith("ConflictError(409, '{")
+        meta = _opensearch_failure_metadata(rendered)
+        assert meta is not None
+        assert meta["component"] == "opensearch"
+        assert meta["actionable_by"] == "RETRYABLE"
+
+    def test_single_document_conflict_renders_a_short_reason(self):
+        from opensearchpy.connection.base import Connection
+        from opensearchpy.exceptions import ConflictError
+
+        # Single-document writes render differently — a reason string rather than
+        # a JSON body — and must classify identically.
+        body = (
+            '{"error":{"root_cause":[{"type":"version_conflict_engine_exception",'
+            '"reason":"[7]: version conflict"}],'
+            '"type":"version_conflict_engine_exception"},"status":409}'
+        )
+        with pytest.raises(ConflictError) as excinfo:
+            Connection()._raise_error(409, body, "application/json")
+
+        rendered = str(excinfo.value)
+        assert rendered.startswith("ConflictError(409, 'version_conflict_engine_exception'")
+        meta = _opensearch_failure_metadata(rendered)
+        assert meta is not None
+        assert meta["component"] == "opensearch"
+
+    def test_non_opensearch_text_is_not_classified(self):
+        for text in (
+            "",
+            "Docling conversion did not complete (timeout): polling exceeded 300s",
+            "the sync hit a ConflictError while running",  # prose, no (status)
+        ):
+            assert _opensearch_failure_metadata(text) is None
+
+
+class TestGetTaskStatus2OpenSearchFailure:
+    def test_conflict_surfaces_as_structured_metadata(self, task_service):
+        ft = _make_file_task(
+            filename="logo.png",
+            phase=IngestionPhase.LANGFLOW,
+            error=(
+                'ConflictError(409, \'{"took":9,"total":3,"updated":1,'
+                '"version_conflicts":1,"failures":[{"index":"documents","id":"7"}]}\')'
+            ),
+        )
+        task = _make_upload_task("os409", {"logo.png": ft})
+        task.status = TaskStatus.FAILED
+        task.failed_files = 1
+        _store_task(task_service, "user1", task)
+
+        file_entry = task_service.get_task_status2("user1", "os409")["files"]["logo.png"]
+
+        assert file_entry["status"] == "failed"
+        assert file_entry["component"] == "opensearch"
+        assert file_entry["failure_phase"] == "indexing"
+        assert file_entry["actionable_by"] == "RETRYABLE"
+        # The payload must not reach the user as the displayed message...
+        assert "{" not in file_entry["user_facing_message"]
+        assert "version_conflicts" not in file_entry["user_facing_message"]
+        # ...but the raw error stays on the entry, which is the only way to
+        # diagnose which OpenSearch operation actually failed.
+        assert file_entry["error"].startswith("ConflictError(409, '{")
+
+
+class TestRejectedUploads:
+    def test_files_over_the_limit_stay_on_a_task(self, task_service):
+        task_id = task_service.record_rejected_uploads(
+            "user1",
+            [("huge.pdf", 5 * 1024 * 1024), ("big.pdf", 9 * 1024 * 1024)],
+        )
+
+        status = task_service.get_task_status2("user1", task_id)
+
+        assert status["status"] == "completed"
+        assert status["total_files"] == 2
+        assert status["failed_files"] == 2
+        assert status["successful_files"] == 0
+        names = {entry["filename"] for entry in status["files"].values()}
+        assert names == {"huge.pdf", "big.pdf"}
+        for entry in status["files"].values():
+            assert entry["status"] == "failed"
+            assert entry["actionable_by"] == "USER_ACTIONABLE"
+            assert "OPENRAG_MAX_UPLOAD_MB" in entry["user_facing_message"]
+
+    def test_later_rejections_join_the_same_task(self, task_service):
+        task_id = task_service.record_rejected_uploads("user1", [("huge.pdf", 5 * 1024 * 1024)])
+        task_service.record_rejected_uploads(
+            "user1",
+            [("big.pdf", 9 * 1024 * 1024)],
+            task_id=task_id,
+        )
+
+        status = task_service.get_task_status2("user1", task_id)
+
+        assert status["failed_files"] == 2
+        assert len(status["files"]) == 2

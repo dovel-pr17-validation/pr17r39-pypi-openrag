@@ -1,0 +1,433 @@
+"use client";
+
+import { ArrowUpRight, Loader2 } from "lucide-react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import { useGetModelCatalogQuery } from "@/app/api/queries/useGetModelsQuery";
+import { useGetSettingsQuery } from "@/app/api/queries/useGetSettingsQuery";
+import { ConfirmationDialog } from "@/components/confirmation-dialog";
+import { LabelWrapper } from "@/components/label-wrapper";
+import {
+  findGroupedSelection,
+  groupedCatalogOptions,
+} from "@/components/models/catalog-models";
+import { ModelFeatures } from "@/components/models/model-features";
+import {
+  getModelLogo,
+  requiresExplicitModelSelection,
+} from "@/components/models/model-helpers";
+import { ModelSelector } from "@/components/models/model-selector";
+import { RequirePermission } from "@/components/require-permission";
+import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { useAuth } from "@/contexts/auth-context";
+import { useIsCloudBrand } from "@/contexts/brand-context";
+import { useRegisterDirty } from "@/contexts/unsaved-changes-context";
+import { trackButton } from "@/lib/analytics";
+import { apiClient } from "@/lib/api-client";
+import { DEFAULT_AGENT_SETTINGS, UI_CONSTANTS } from "@/lib/constants";
+import { resolveLangflowEditUrl } from "@/lib/url-utils";
+import { cn } from "@/lib/utils";
+import { useUpdateSettingsMutation } from "../../api/mutations/useUpdateSettingsMutation";
+import { LangflowIcon } from "./langflow-icon";
+
+const { MAX_SYSTEM_PROMPT_CHARS } = UI_CONSTANTS;
+
+export function AgentSettingsSection() {
+  const isCloudBrand = useIsCloudBrand();
+  const { isAuthenticated, isNoAuthMode, isIbmAuthMode, runMode } = useAuth();
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+
+  const focusLlmModel = searchParams.get("focusLlmModel") === "true";
+  const [isRestoringFlow, setIsRestoringFlow] = useState<boolean>(false);
+  const [openLlmSelector, setOpenLlmSelector] = useState(false);
+  const [systemPrompt, setSystemPrompt] = useState<string>("");
+  const [userEdited, setUserEdited] = useState(false);
+
+  const { data: settings = {} } = useGetSettingsQuery({
+    enabled: isAuthenticated || isNoAuthMode,
+  });
+
+  const {
+    data: catalog,
+    isLoading: catalogLoading,
+    // The catalogue query does not retry, so a failed fetch leaves the groups
+    // empty. Without this flag the selector would tell the user to configure a
+    // provider when the real problem is that the catalogue never loaded.
+    isError: catalogError,
+  } = useGetModelCatalogQuery({
+    enabled: isAuthenticated || isNoAuthMode,
+  });
+
+  const configuredProviders = useMemo(
+    () => ({
+      openai: settings.providers?.openai?.configured === true,
+      anthropic: settings.providers?.anthropic?.configured === true,
+      ollama: settings.providers?.ollama?.configured === true,
+      watsonx: settings.providers?.watsonx?.configured === true,
+      ...Object.fromEntries(
+        Object.entries(settings.providers?.custom ?? {}).map(
+          ([provider, value]) => [provider, value.configured === true],
+        ),
+      ),
+    }),
+    [settings.providers],
+  );
+
+  const groupedLlmModels = useMemo(
+    () =>
+      groupedCatalogOptions(catalog, configuredProviders, "language").map(
+        (group) => ({
+          group: group.group,
+          provider: group.key,
+          icon: getModelLogo("", group.key),
+          options: group.options,
+        }),
+      ),
+    [catalog, configuredProviders],
+  );
+
+  const isLoadingAnyLlmModels = catalogLoading;
+
+  const updateSettingsMutation = useUpdateSettingsMutation({
+    onSuccess: () => {
+      toast.success("Settings updated successfully");
+    },
+    onError: (error) => {
+      toast.error("Failed to update settings", { description: error.message });
+    },
+  });
+
+  const allLlmOptions = useMemo(
+    () => groupedLlmModels.flatMap((g) => g.options),
+    [groupedLlmModels],
+  );
+  const selectedLlmMatch = findGroupedSelection(
+    groupedLlmModels,
+    settings.agent?.llm_model,
+    settings.agent?.llm_provider,
+  );
+  const selectedLlm = selectedLlmMatch?.option;
+  const selectedLlmGroup = selectedLlmMatch?.group;
+  const needsExplicitLlmModel =
+    requiresExplicitModelSelection(settings.agent?.llm_provider) &&
+    !settings.agent?.llm_model;
+
+  const handleModelChange = useCallback(
+    (newModel: string, provider?: string) => {
+      if (newModel && provider) {
+        updateSettingsMutation.mutate({
+          llm_model: newModel,
+          llm_provider: provider,
+        });
+      } else if (newModel) {
+        updateSettingsMutation.mutate({ llm_model: newModel });
+      }
+    },
+    [updateSettingsMutation],
+  );
+
+  const autoSelectedLlm = useRef(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: provider changes reset the one-shot fallback guard.
+  useEffect(() => {
+    autoSelectedLlm.current = false;
+  }, [settings.agent?.llm_provider]);
+
+  useEffect(() => {
+    if (requiresExplicitModelSelection(settings.agent?.llm_provider)) return;
+    if (settings.agent?.llm_model) {
+      autoSelectedLlm.current = false;
+      return;
+    }
+    if (autoSelectedLlm.current) return;
+    if (allLlmOptions.length > 0) {
+      autoSelectedLlm.current = true;
+      const fallback = allLlmOptions.find((o) => o.default) || allLlmOptions[0];
+      handleModelChange(fallback.value, fallback.provider);
+    }
+  }, [
+    settings.agent?.llm_model,
+    settings.agent?.llm_provider,
+    allLlmOptions,
+    handleModelChange,
+  ]);
+
+  const agentDirty = systemPrompt !== (settings.agent?.system_prompt ?? "");
+  useRegisterDirty("agent-settings", userEdited && agentDirty);
+
+  useEffect(() => {
+    if (settings.agent?.system_prompt) {
+      setSystemPrompt(settings.agent.system_prompt);
+    }
+  }, [settings.agent?.system_prompt]);
+
+  useEffect(() => {
+    if (focusLlmModel) {
+      setOpenLlmSelector(true);
+      const agentCard = document.getElementById("agent-card");
+      if (agentCard)
+        agentCard.scrollIntoView({ behavior: "smooth", block: "start" });
+      const newParams = new URLSearchParams(searchParams.toString());
+      newParams.delete("focusLlmModel");
+      router.replace(`${pathname}?${newParams.toString()}`, { scroll: false });
+      const timeoutId = setTimeout(() => setOpenLlmSelector(false), 100);
+      return () => clearTimeout(timeoutId);
+    }
+  }, [focusLlmModel, searchParams, router, pathname]);
+
+  const handleSystemPromptSave = () => {
+    trackButton({
+      CTA: "Save Agent Instructions",
+      elementId: "save-agent-instructions-button",
+      namespace: "settings",
+    });
+    updateSettingsMutation.mutate(
+      { system_prompt: systemPrompt },
+      { onSuccess: () => setUserEdited(false) },
+    );
+  };
+
+  const handleEditInLangflow = (closeDialog: () => void) => {
+    trackButton({
+      CTA: "Edit in Langflow - Agent",
+      elementId: "edit-langflow-agent-button",
+      namespace: "settings",
+    });
+    window.open(
+      resolveLangflowEditUrl({
+        flowId: settings.flow_id,
+        editUrlOverride: settings.langflow_edit_url,
+        publicUrl: settings.langflow_public_url,
+        langflowPort: settings.langflow_port,
+        isIbmAuthMode,
+        runMode,
+      }),
+      "_blank",
+      "noopener,noreferrer",
+    );
+    closeDialog();
+  };
+
+  const handleRestoreRetrievalFlow = (closeDialog: () => void) => {
+    setIsRestoringFlow(true);
+
+    trackButton({
+      CTA: "Restore Flow - Agent",
+      elementId: "restore-agent-flow-button",
+      namespace: "settings",
+    });
+
+    apiClient
+      .post("/reset-flow/retrieval")
+      .then((res) => {
+        if (res.status < 200 || res.status >= 300) {
+          const body = res.data ?? {};
+          throw new Error(body.error ?? `HTTP ${res.status}`);
+        }
+        return (
+          // The flow reset above only replaces the Langflow graph. The system
+          // prompt lives in a separate store, so restore must persist the
+          // default there too, or it reverts on refresh while leaving Save
+          // stuck enabled against it.
+          updateSettingsMutation.mutateAsync({
+            system_prompt: DEFAULT_AGENT_SETTINGS.system_prompt,
+          })
+        );
+      })
+      .then(() => {
+        setSystemPrompt(DEFAULT_AGENT_SETTINGS.system_prompt);
+        setUserEdited(false);
+        toast.success("Default agent flow settings restored successfully");
+        closeDialog();
+      })
+      .catch((err) => {
+        console.error("Error restoring retrieval flow:", err);
+        toast.error(
+          err.message || "Failed to restore default agent flow settings",
+        );
+        closeDialog();
+      })
+      .finally(() => setIsRestoringFlow(false));
+  };
+
+  return (
+    <section id="agent-card" className="space-y-8">
+      <header className="flex flex-col gap-6 md:flex-row md:items-start md:justify-between">
+        <div className="max-w-[685px] space-y-3">
+          <h3
+            className={cn(
+              "text-lg font-semibold leading-tight tracking-tight",
+              isCloudBrand && "ibm-settings-section-title",
+            )}
+          >
+            Agent
+          </h3>
+          <p className="text-sm text-muted-foreground">
+            This Agent retrieves from your knowledge and generates chat
+            responses. Edit in Langflow for full control.
+          </p>
+        </div>
+        <RequirePermission perm="flows:edit">
+          <div className="flex shrink-0 gap-2">
+            <ConfirmationDialog
+              trigger={
+                <Button ignoreTitleCase={true} variant="outline">
+                  Restore flow
+                </Button>
+              }
+              title="Restore default Agent flow"
+              description="This restores defaults and discards all custom settings and overrides. This can't be undone."
+              confirmText="Restore"
+              variant="destructive"
+              onConfirm={handleRestoreRetrievalFlow}
+              isLoading={isRestoringFlow}
+            />
+            <ConfirmationDialog
+              trigger={
+                <Button>
+                  <LangflowIcon />
+                  Edit in Langflow
+                </Button>
+              }
+              title="Edit Agent flow in Langflow"
+              description={
+                <>
+                  <p className="mb-2">
+                    You&apos;re entering Langflow. You can edit the{" "}
+                    <b>Agent flow</b> and other underlying flows. Manual changes
+                    to components, wiring, or I/O can break this experience.
+                  </p>
+                  <p className="mb-2">
+                    To enable editing, you need to unlock the flow by clicking
+                    on its name and disabling the <b>Lock flow</b> option.
+                  </p>
+                  <p>You can restore this flow from Settings.</p>
+                </>
+              }
+              confirmText="Proceed"
+              confirmIcon={<ArrowUpRight />}
+              onConfirm={handleEditInLangflow}
+              variant="warning"
+            />
+          </div>
+        </RequirePermission>
+      </header>
+      <div className="space-y-6">
+        <div className="space-y-6">
+          <LabelWrapper
+            label="Language model"
+            helperText={
+              needsExplicitLlmModel ? undefined : "Model used for chat"
+            }
+            description={
+              needsExplicitLlmModel
+                ? "Select or enter an Azure deployment name before chatting"
+                : undefined
+            }
+            id="language-model"
+            required={true}
+          >
+            <ModelSelector
+              groupedOptions={groupedLlmModels}
+              custom
+              noOptionsPlaceholder={
+                isLoadingAnyLlmModels
+                  ? "Loading models..."
+                  : catalogError
+                    ? "Could not load the model catalogue. Retry later."
+                    : "No language models detected. Configure a provider first."
+              }
+              value={settings.agent?.llm_model || ""}
+              selectedProvider={settings.agent?.llm_provider}
+              onValueChange={handleModelChange}
+              searchPlaceholder={
+                requiresExplicitModelSelection(settings.agent?.llm_provider)
+                  ? "Search models or type Azure deployment name"
+                  : undefined
+              }
+              hasError={needsExplicitLlmModel}
+              defaultOpen={openLlmSelector}
+            />
+          </LabelWrapper>
+          {settings.agent?.llm_model && selectedLlmGroup && (
+            <ModelFeatures
+              model={selectedLlm?.model ?? { model: settings.agent.llm_model }}
+              providerName={selectedLlmGroup.group}
+              provider={selectedLlmGroup.provider}
+            />
+          )}
+        </div>
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-4">
+            <Label htmlFor="system-prompt" className="font-medium text-mmd!">
+              Agent instructions
+            </Label>
+            <span
+              aria-live="polite"
+              className={cn(
+                "text-xs tabular-nums",
+                systemPrompt.length > MAX_SYSTEM_PROMPT_CHARS
+                  ? "text-destructive"
+                  : "text-muted-foreground",
+              )}
+            >
+              {systemPrompt.length}/{MAX_SYSTEM_PROMPT_CHARS}
+            </span>
+          </div>
+          <Textarea
+            id="system-prompt"
+            placeholder="Enter your agent instructions here..."
+            value={systemPrompt}
+            onChange={(e) => {
+              setUserEdited(true);
+              setSystemPrompt(e.target.value);
+            }}
+            rows={14}
+            className={cn(
+              "resize-y",
+              systemPrompt.length > MAX_SYSTEM_PROMPT_CHARS &&
+                "border-destructive! focus:border-destructive",
+            )}
+          />
+        </div>
+        <div className="flex justify-end gap-4 pt-2">
+          {settings.agent?.default_system_prompt && (
+            <Button
+              ignoreTitleCase={true}
+              onClick={() => {
+                setUserEdited(true);
+                setSystemPrompt(settings.agent?.default_system_prompt || "");
+              }}
+              variant="ghost"
+              disabled={systemPrompt === settings.agent.default_system_prompt}
+            >
+              Restore default
+            </Button>
+          )}
+          <Button
+            ignoreTitleCase={true}
+            onClick={handleSystemPromptSave}
+            disabled={
+              updateSettingsMutation.isPending ||
+              systemPrompt.length > MAX_SYSTEM_PROMPT_CHARS
+            }
+            className="min-w-[120px]"
+          >
+            {updateSettingsMutation.isPending ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                Saving...
+              </>
+            ) : (
+              "Save agent instructions"
+            )}
+          </Button>
+        </div>
+      </div>
+    </section>
+  );
+}

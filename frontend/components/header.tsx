@@ -1,0 +1,162 @@
+"use client";
+
+import { Bell, PanelLeft } from "lucide-react";
+import { BrandSwitcher } from "@/components/brand-switcher";
+import { ConsoleStatusButton } from "@/components/console-status";
+import { DevRoleToggle } from "@/components/dev-role-toggle";
+import Logo from "@/components/icons/openrag-logo";
+import { UserNav } from "@/components/user-nav";
+import { useAuth } from "@/contexts/auth-context";
+import { useIsCloudBrand } from "@/contexts/brand-context";
+import {
+  useConsoleStatus,
+  useToggleTaskMenu,
+} from "@/contexts/console-status-context";
+import { useSidebarOverlay } from "@/contexts/sidebar-overlay-context";
+import { useTask } from "@/contexts/task-context";
+import { useNarrowLayout } from "@/hooks/use-narrow-layout";
+import { cn } from "@/lib/utils";
+import { useProviderHealth } from "./provider-health-banner";
+
+export function Header() {
+  const isCloudBrand = useIsCloudBrand();
+  const { tasks } = useTask();
+  const activeTaskCount = tasks.filter(
+    (t) =>
+      t.status === "pending" ||
+      t.status === "running" ||
+      t.status === "processing",
+  ).length;
+  const failedTaskCount = tasks.filter(
+    (t) => t.status === "failed" || t.status === "error",
+  ).length;
+  const toggleTaskMenu = useToggleTaskMenu();
+  const { runMode } = useAuth();
+  const isNarrow = useNarrowLayout();
+  const {
+    show: showSidebar,
+    hide: hideSidebar,
+    isPinned,
+    isCollapsed,
+    pin: pinSidebar,
+    unpin: unpinSidebar,
+    expand: expandSidebar,
+  } = useSidebarOverlay();
+
+  const {
+    toggle,
+    isOpen,
+    overallStatus: consoleOverallStatus,
+  } = useConsoleStatus();
+  const { isUnhealthy: isProviderUnhealthy } = useProviderHealth();
+  const overallStatus = isProviderUnhealthy
+    ? "unhealthy"
+    : consoleOverallStatus;
+
+  return (
+    <header className={cn(`flex w-full h-full items-center justify-between`)}>
+      <div className="header-start-display px-[16px]">
+        <div className="flex items-center gap-2">
+          {isNarrow ? (
+            <button
+              type="button"
+              aria-label={isPinned ? "Close navigation" : "Open navigation"}
+              onMouseEnter={showSidebar}
+              onMouseLeave={hideSidebar}
+              onClick={isPinned ? unpinSidebar : pinSidebar}
+              className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+            >
+              <PanelLeft className="size-5" />
+            </button>
+          ) : isCollapsed ? (
+            <button
+              type="button"
+              aria-label="Open navigation"
+              onMouseEnter={showSidebar}
+              onMouseLeave={hideSidebar}
+              onClick={expandSidebar}
+              className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+            >
+              <PanelLeft className="size-5" />
+            </button>
+          ) : null}
+          <div className="flex items-center">
+            <Logo className="fill-foreground" width={24} height={22} />
+            <span
+              className="text-lg font-semibold pl-2.5"
+              style={{ fontFamily: '"IBM Plex Mono", monospace' }}
+            >
+              OpenRAG
+            </span>
+          </div>
+        </div>
+      </div>
+      <div className="header-end-division">
+        <div className="justify-end flex items-center">
+          {/* Knowledge Filter Dropdown */}
+          {/* <KnowledgeFilterDropdown
+              selectedFilter={selectedFilter}
+              onFilterSelect={setSelectedFilter}
+            /> */}
+
+          {/* GitHub Star Button */}
+          {/* <GitHubStarButton repo="phact/openrag" /> */}
+
+          {/* Discord Link */}
+          {/* <DiscordLink inviteCode="EqksyE2EX9" /> */}
+
+          {process.env.NEXT_PUBLIC_IBM_THEME_DEV === "true" && (
+            <>
+              <BrandSwitcher />
+              <DevRoleToggle />
+              {/* Separator */}
+              <div className="w-px h-6 bg-border mx-3" />
+            </>
+          )}
+
+          {/* Console Status button — OSS only */}
+          {runMode === "oss" && (
+            <>
+              <ConsoleStatusButton
+                onClick={toggle}
+                isOpen={isOpen}
+                overallStatus={overallStatus}
+              />
+              <div className="w-px h-6 bg-border mx-3" />
+            </>
+          )}
+
+          {/* Task + System Notification Bell */}
+          <button
+            type="button"
+            onClick={toggleTaskMenu}
+            data-testid="task-menu-toggle"
+            className="relative h-8 w-8 hover:bg-muted rounded-lg flex items-center justify-center"
+          >
+            <Bell
+              size={16}
+              className={
+                isCloudBrand ? "text-foreground" : "text-muted-foreground"
+              }
+            />
+            {activeTaskCount > 0 && (
+              <span className="absolute -right-1 -top-1 flex min-w-[16px] h-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold leading-none text-primary-foreground">
+                {activeTaskCount > 99 ? "99+" : activeTaskCount}
+              </span>
+            )}
+            {activeTaskCount === 0 && failedTaskCount > 0 && (
+              <span className="absolute -right-1 -top-1 flex min-w-[16px] h-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-semibold leading-none text-destructive-foreground">
+                {failedTaskCount > 99 ? "99+" : failedTaskCount}
+              </span>
+            )}
+          </button>
+
+          {/* Separator */}
+          <div className="w-px h-6 bg-border mx-3" />
+
+          <UserNav />
+        </div>
+      </div>
+    </header>
+  );
+}

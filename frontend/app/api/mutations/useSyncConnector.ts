@@ -1,0 +1,171 @@
+"use client";
+
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import type { IngestSettings } from "@/components/cloud-picker/types";
+import { apiClient } from "@/lib/api-client";
+
+// Response types
+interface SyncResponse {
+  task_ids?: string[];
+  status: string;
+  message: string;
+  connections_synced?: number;
+  synced_connectors?: string[];
+  skipped_connectors?: string[];
+  deleted_only_connectors?: string[];
+  errors?: Array<{ connector_type: string; error: string }> | null;
+}
+
+export interface OrphanFile {
+  document_id: string;
+  filename: string;
+}
+
+export interface SyncPreviewResponse {
+  connector_type: string;
+  synced_count: number;
+  orphans: OrphanFile[];
+  /** False when strict gating aborted orphan detection (e.g. an active
+   * connection was unauthenticated). UI should reflect that deletions
+   * cannot be predicted in that case. */
+  orphans_available: boolean;
+  /** Files whose source copy changed and that the sync will re-ingest. */
+  updates: OrphanFile[];
+  /** False when this connector can't tell in advance — it decides per file
+   * while ingesting. Not the same as "nothing will be updated". */
+  updates_available: boolean;
+}
+
+export interface SyncAllPreviewResponse {
+  orphans_by_type: Record<string, OrphanFile[]>;
+  synced_count_by_type: Record<string, number>;
+  orphans_available_by_type: Record<string, boolean>;
+  updates_by_type: Record<string, OrphanFile[]>;
+  updates_available_by_type: Record<string, boolean>;
+}
+
+// Sync all cloud connectors
+const syncAllConnectors = async (): Promise<SyncResponse> => {
+  const response = await apiClient.post("/connectors/sync-all");
+
+  if (response.status < 200 || response.status >= 300) {
+    const error = response.data ?? {};
+    throw new Error(error.error || "Failed to sync connectors");
+  }
+
+  return response.data;
+};
+
+// Sync a specific connector type
+const syncConnector = async ({
+  connectorType,
+  body,
+}: {
+  connectorType: string;
+  body?: {
+    connection_id?: string;
+    max_files?: number;
+    selected_files?: Array<{
+      id: string;
+      name: string;
+      mimeType: string;
+      downloadUrl?: string;
+      size?: number;
+    }>;
+    settings?: IngestSettings;
+    /** When true, ingest all files from the connector (bypasses the re-sync gate). */
+    sync_all?: boolean;
+    /** Restrict ingest to these bucket names (bucket connectors). */
+    bucket_filter?: string[];
+    /** When true, replace any indexed document with the same filename. */
+    replace_duplicates?: boolean;
+    /** When true (COS only), index without an owner so all users in the instance can retrieve the document. */
+    shared?: boolean;
+  };
+}): Promise<SyncResponse> => {
+  const response = await apiClient.post(
+    `/connectors/${connectorType}/sync`,
+    body || {},
+  );
+
+  if (response.status < 200 || response.status >= 300) {
+    const error = response.data ?? {};
+    throw new Error(error.error || `Failed to sync ${connectorType}`);
+  }
+
+  return response.data;
+};
+
+export const useSyncAllConnectors = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: syncAllConnectors,
+    onSettled: () => {
+      // Immediately refetch tasks so new sync jobs appear in the task list
+      queryClient.invalidateQueries({ queryKey: ["tasks"], exact: false });
+    },
+  });
+};
+
+export const useSyncConnector = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: syncConnector,
+    onSettled: () => {
+      // Immediately refetch tasks so new sync jobs appear in the task list
+      queryClient.invalidateQueries({ queryKey: ["tasks"], exact: false });
+    },
+  });
+};
+
+const syncConnectorPreview = async (
+  connectorType: string,
+): Promise<SyncPreviewResponse> => {
+  const response = await apiClient.post(
+    `/connectors/${connectorType}/sync-preview`,
+  );
+
+  if (response.status < 200 || response.status >= 300) {
+    const error = response.data ?? {};
+    throw new Error(
+      error.error || `Failed to preview sync for ${connectorType}`,
+    );
+  }
+
+  return response.data;
+};
+
+const syncAllConnectorsPreview = async (): Promise<SyncAllPreviewResponse> => {
+  const response = await apiClient.post("/connectors/sync-all-preview");
+
+  if (response.status < 200 || response.status >= 300) {
+    const error = response.data ?? {};
+    throw new Error(error.error || "Failed to preview sync");
+  }
+
+  return response.data;
+};
+
+export const useSyncConnectorPreview = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: syncConnectorPreview,
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["tasks"], exact: false });
+    },
+  });
+};
+
+export const useSyncAllConnectorsPreview = () => {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: syncAllConnectorsPreview,
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["tasks"], exact: false });
+    },
+  });
+};

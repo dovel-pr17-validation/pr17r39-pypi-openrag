@@ -1,0 +1,873 @@
+import asyncio
+import json
+import platform
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+from pydantic import BaseModel, computed_field
+
+from config.settings import (
+    DOCLING_ERROR_DETAIL_MAX_LENGTH,
+    DOCLING_SERVE_URL,
+    DOCLING_SERVE_VERIFY_SSL,
+    get_openrag_config,
+)
+from utils.container_utils import transform_localhost_url
+from utils.logging_config import get_logger
+from utils.run_mode_utils import is_run_mode_on_prem, is_run_mode_saas
+
+logger = get_logger(__name__)
+
+
+class DoclingConfig(BaseModel):
+    """Only used to shape the legacy /settings/docling-preset response.
+
+    The actual Docling Serve request payload is built from a plain dict
+    (see get_docling_preset_configs), so this model doesn't need to match
+    Docling Serve's field names.
+    """
+
+    do_ocr: bool
+    ocr_preset: str
+    ocr_lang: list[str] | None = None
+    do_table_structure: bool
+    do_picture_classification: bool
+    do_picture_description: bool
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ocr_engine(self) -> str:
+        """Deprecated alias for ocr_preset, kept for legacy API callers."""
+        return self.ocr_preset
+
+
+class DoclingServeError(Exception):
+    """Raised when docling-serve conversion fails."""
+
+
+class DoclingTransientError(DoclingServeError):
+    """Raised for errors that may resolve on retry (network failures, 5xx)."""
+
+
+class DoclingPayloadTooLarge(DoclingServeError):
+    """The proxy in front of docling-serve rejected the file body (HTTP 413).
+
+    ``str(self)`` is the line shown to users. ``operator_detail`` keeps the
+    internal endpoint for logs.
+    """
+
+    def __init__(self, message: str, *, operator_detail: str | None = None):
+        super().__init__(message)
+        self.operator_detail = operator_detail
+
+
+class DoclingTaskState(StrEnum):
+    """Result of a single status check against Docling Serve."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SUCCESS = "success"
+    FAILED = "failed"
+    NOT_FOUND = "not_found"
+
+
+@dataclass
+class DoclingStatusSnapshot:
+    """Single-point-in-time view of a Docling task's state."""
+
+    state: DoclingTaskState
+    detail: str | None = None
+    raw: dict | None = None
+
+
+# OCR language codes are engine-specific: ocrmac (Apple Vision) takes BCP-47
+# tags, easyocr takes its own short codes. OpenRAG stores neutral codes in
+# KnowledgeConfig so one config survives moving between a macOS host and a
+# Linux container, and they are translated per engine at request time.
+OCR_LANGUAGE_CODES: dict[str, dict[str, str]] = {
+    "ocrmac": {
+        "en": "en-US",
+        "ja": "ja-JP",
+        "ko": "ko-KR",
+        "zh-Hans": "zh-Hans",
+        "zh-Hant": "zh-Hant",
+        "fr": "fr-FR",
+        "de": "de-DE",
+        "es": "es-ES",
+        "it": "it-IT",
+        "pt": "pt-BR",
+        "ru": "ru-RU",
+        "uk": "uk-UA",
+        "th": "th-TH",
+        "vi": "vi-VN",
+        "ar": "ar-SA",
+    },
+    "easyocr": {
+        "en": "en",
+        "ja": "ja",
+        "ko": "ko",
+        "zh-Hans": "ch_sim",
+        "zh-Hant": "ch_tra",
+        "fr": "fr",
+        "de": "de",
+        "es": "es",
+        "it": "it",
+        "pt": "pt",
+        "ru": "ru",
+        "uk": "uk",
+        "th": "th",
+        "vi": "vi",
+        "ar": "ar",
+    },
+}
+
+
+def strip_provider_prefix(model: str, provider: str) -> str:
+    """The bare model name from a possibly provider-tagged VLM id.
+
+    `knowledge.vlm_provider` and `knowledge.vlm_model` are separate fields, so
+    the model is usually already bare. It is not always: a tagged id can reach
+    here from config written by hand or carried over from a picker.
+
+    Both separators are accepted. `:` is the canonical one
+    (`llm_gateway.PROVIDER_SEPARATOR`, and the one embedding-space ids use);
+    `/` is the legacy form kept working elsewhere in the codebase. Only `/`
+    used to be stripped, so an id stored as `azure_ai:gpt-4o` was sent to the
+    provider with the prefix still attached — a model name no deployment has.
+    """
+    name = (model or "").strip()
+    key = (provider or "").strip().lower()
+    if not name or not key:
+        return name
+    for separator in (":", "/"):
+        prefix = f"{key}{separator}"
+        if name.lower().startswith(prefix):
+            return name[len(prefix) :]
+    return name
+
+
+def resolve_ocr_languages(engine: str, languages: list[str]) -> list[str]:
+    """Translate OpenRAG's neutral OCR language codes into engine-specific ones.
+
+    Unrecognized codes pass through untouched so an operator can name an engine
+    code OpenRAG does not know about rather than have it silently dropped.
+    """
+    mapping = OCR_LANGUAGE_CODES.get(engine, {})
+    # Apple Vision treats earlier languages as higher priority. Keep English as
+    # the fallback so adding another language does not suppress its script.
+    prioritized = [language for language in languages if language != "en"]
+    if "en" in languages:
+        prioritized.append("en")
+    return [mapping.get(language, language) for language in prioritized]
+
+
+def get_docling_preset_configs(
+    table_structure=False, ocr=False, picture_descriptions=False, ocr_languages=None
+) -> dict[str, Any]:
+    """Get docling preset configurations based on toggle settings"""
+    is_macos = platform.system() == "Darwin"
+    engine = "ocrmac" if is_macos else "easyocr"
+
+    config = {
+        "do_ocr": ocr,
+        # ocr_preset is the supported replacement for deprecated ocr_engine.
+        "ocr_preset": engine,
+        "do_table_structure": table_structure,
+        "do_picture_classification": picture_descriptions,
+        "do_picture_description": picture_descriptions,
+    }
+
+    if ocr_languages:
+        config["ocr_lang"] = resolve_ocr_languages(engine, ocr_languages)
+
+    return config
+
+
+def _stringify_docling_error_value(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("error_message", "message", "detail", "error"):
+            nested = _stringify_docling_error_value(value.get(key))
+            if nested:
+                return nested
+        return json.dumps(value, default=str)
+    if value:
+        return str(value)
+    return None
+
+
+def _format_docling_error(payload: dict[str, Any]) -> str:
+    messages = []
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        for error in errors:
+            message = _stringify_docling_error_value(error)
+            if message:
+                messages.append(message)
+    else:
+        message = _stringify_docling_error_value(errors)
+        if message:
+            messages.append(message)
+
+    for key in ("error_message", "message", "detail", "error"):
+        message = _stringify_docling_error_value(payload.get(key))
+        if message:
+            messages.append(message)
+
+    if messages:
+        result = "; ".join(dict.fromkeys(messages))
+    else:
+        result = json.dumps(payload, default=str)
+
+    if not result:
+        return "Unknown Docling processing error"
+
+    if len(result) > DOCLING_ERROR_DETAIL_MAX_LENGTH:
+        return f"{result[:DOCLING_ERROR_DETAIL_MAX_LENGTH]}..."
+    return result
+
+
+def _extract_document_json_content(payload: dict[str, Any], *, task_id: str) -> dict[str, Any]:
+    """Return ``document.json_content`` from a ``/v1/result`` payload.
+
+    docling-serve reports the *task* as ``success`` even when the *conversion*
+    failed (e.g. a password-protected or corrupted PDF). The failure reason then
+    lives in the result body's ``status`` / ``errors`` and ``json_content`` is
+    null, so those are checked first — otherwise the real cause is discarded and
+    every conversion failure reads as a malformed response.
+
+    Raises:
+        DoclingServeError: the conversion failed, or the payload carries no
+            ``document.json_content``.
+    """
+    logger.debug("Extracting document from docling result", task_id=task_id)
+
+    status = payload.get("status")
+    if status == "failure" or payload.get("errors"):
+        detail = _format_docling_error(payload)
+        logger.warning(
+            "Docling conversion failed",
+            task_id=task_id,
+            status=status,
+            error=detail,
+        )
+        raise DoclingServeError(f"Docling processing failed: {detail}")
+
+    document = payload.get("document")
+    if not isinstance(document, dict):
+        document = {}
+    doc_content = document.get("json_content")
+    if doc_content is None:
+        logger.error(
+            "Docling result missing document.json_content",
+            task_id=task_id,
+            status=status,
+            document_keys=sorted(document) if isinstance(document, dict) else None,
+        )
+        raise DoclingServeError(
+            f"docling-serve response missing document.json_content (status={status!r})"
+        )
+
+    logger.debug("Successfully extracted document from docling result", task_id=task_id)
+    return doc_content
+
+
+class DoclingService:
+    _default_client: httpx.AsyncClient | None = None
+
+    def __init__(
+        self, docling_url: str | None = None, httpx_client: httpx.AsyncClient | None = None
+    ):
+        """
+        Initialize the DoclingService.
+
+        Args:
+            docling_url: Base URL of the Docling Serve instance. If None, auto-detects.
+            httpx_client: Pre-configured httpx async client.
+        """
+        if docling_url:
+            self.docling_url = docling_url.rstrip("/")
+        else:
+            self.docling_url = DOCLING_SERVE_URL
+
+        self.httpx_client = httpx_client
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self.httpx_client:
+            return self.httpx_client
+        if DoclingService._default_client is None or DoclingService._default_client.is_closed:
+            DoclingService._default_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(300.0, connect=10.0), verify=DOCLING_SERVE_VERIFY_SSL
+            )
+        return DoclingService._default_client
+
+    async def _build_docling_options_async(
+        self,
+        *,
+        ocr_override: bool | None = None,
+        picture_descriptions_override: bool | None = None,
+        preview_mode: bool = False,
+    ) -> dict[str, Any]:
+        """Build the options payload for docling from OpenRAG configs, incorporating VLM settings if enabled."""
+        from enhancements.providers.watsonx.iam import WatsonxIamError, get_iam_token
+
+        config = get_openrag_config()
+        knowledge_config = config.knowledge
+
+        is_ocr_enabled = ocr_override if ocr_override is not None else knowledge_config.ocr
+        is_pic_desc_enabled = (
+            picture_descriptions_override
+            if picture_descriptions_override is not None
+            else knowledge_config.picture_descriptions
+        )
+
+        preset = get_docling_preset_configs(
+            table_structure=knowledge_config.table_structure,
+            ocr=is_ocr_enabled,
+            picture_descriptions=is_pic_desc_enabled,
+            ocr_languages=knowledge_config.ocr_languages,
+        )
+
+        image_export_mode = "embedded" if preview_mode else "placeholder"
+        options = {"to_formats": "json", "image_export_mode": image_export_mode, **preset}
+        if preview_mode:
+            # The live preview renders full-page screenshots with bounding-box
+            # overlays (docling-img). docling-serve only produces those when
+            # include_page_images is enabled (it defaults to false), so request
+            # both page renderings and picture images explicitly. Without this
+            # the preview shows neither the page image nor the parsed boxes.
+            # Non-paged formats (docx/pptx/…) still parse to JSON texts/tables,
+            # which the preview renders directly as labeled blocks.
+            options["include_page_images"] = True
+            options["include_images"] = True
+
+        # If picture descriptions are enabled, configure custom/local VLM model
+        #
+        # Trust boundary: every `picture_description_api` block below hands the
+        # provider's own credential to docling-serve, which then calls the model
+        # endpoint directly — OpenRAG is not in the path of that request and
+        # does not proxy it. This is how remote VLM has always worked here and
+        # is not specific to Azure, but it means docling-serve is inside the
+        # blast radius of any provider key configured for VLM. Two consequences
+        # worth keeping in mind:
+        #
+        # - these options must never be logged. The credential is a value in
+        #   `headers`, so logging the options dict, or echoing it into an error,
+        #   leaks the key. `DoclingServeError` messages below are written to
+        #   name the *field* that is wrong, never its value.
+        # - a short-lived credential would add an expiry problem on top of the
+        #   trust one, since docling-serve holds whatever it is given for the
+        #   life of the conversion. That is part of why Microsoft Entra
+        #   authentication is not wired through here; see the Azure branches.
+        if is_pic_desc_enabled and knowledge_config.vlm_enabled:
+            provider = knowledge_config.vlm_provider
+            vlm_model = knowledge_config.vlm_model
+            prompt = knowledge_config.vlm_prompt
+
+            if provider == "local":
+                options["picture_description_local"] = {
+                    "repo_id": vlm_model,
+                    "prompt": prompt,
+                }
+            elif provider == "watsonx":
+                watsonx = config.providers.watsonx
+                if not (watsonx.api_key and watsonx.endpoint and watsonx.project_id):
+                    raise DoclingServeError(
+                        "Docling VLM is enabled but the watsonx provider is not fully "
+                        "configured (api key, endpoint, and project id are required)"
+                    )
+                try:
+                    token = await get_iam_token(watsonx.api_key)
+                except httpx.RequestError as e:
+                    raise DoclingTransientError(
+                        f"watsonx IAM token exchange network error: {str(e)}"
+                    ) from e
+                except WatsonxIamError as e:
+                    raise DoclingServeError(str(e)) from e
+
+                url = (
+                    f"{watsonx.endpoint.rstrip('/')}/ml/v1/text/chat"
+                    f"?version={knowledge_config.vlm_watsonx_api_version}"
+                )
+                options["picture_description_api"] = {
+                    "url": url,
+                    "headers": {"Authorization": f"Bearer {token}"},
+                    "params": {
+                        "model_id": vlm_model,
+                        "project_id": watsonx.project_id,
+                        "max_tokens": knowledge_config.vlm_max_tokens,
+                    },
+                    "prompt": prompt,
+                }
+            elif provider == "anthropic":
+                anthropic = config.providers.anthropic
+                if not anthropic.api_key:
+                    raise DoclingServeError(
+                        "Docling VLM is enabled but the Anthropic provider is not configured"
+                    )
+                url = "https://api.anthropic.com/v1/messages"
+                options["picture_description_api"] = {
+                    "url": url,
+                    "headers": {
+                        "x-api-key": anthropic.api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    "params": {
+                        "model": vlm_model,
+                        "max_tokens": knowledge_config.vlm_max_tokens,
+                    },
+                    "prompt": prompt,
+                }
+            elif provider == "ollama":
+                ollama = config.providers.ollama
+                if not ollama.endpoint:
+                    raise DoclingServeError(
+                        "Docling VLM is enabled but the Ollama provider is not configured"
+                    )
+                url = f"{transform_localhost_url(ollama.endpoint).rstrip('/')}/v1/chat/completions"
+                options["picture_description_api"] = {
+                    "url": url,
+                    "headers": {},
+                    "params": {
+                        "model": vlm_model,
+                        "max_completion_tokens": knowledge_config.vlm_max_tokens,
+                    },
+                    "prompt": prompt,
+                }
+            elif provider == "azure":
+                creds = config.providers.credential_values("azure")
+                api_key = creds.get("api_key")
+                endpoint = creds.get("api_base")
+                api_version = creds.get("api_version") or "2024-02-01"
+                if not (api_key and endpoint):
+                    raise DoclingServeError(
+                        "Docling VLM is enabled but the Azure provider is not configured "
+                        "(an API key and endpoint are required)"
+                    )
+                parsed = urlparse(endpoint)
+                if parsed.scheme.lower() != "https" or not parsed.netloc:
+                    raise DoclingServeError("Azure VLM endpoint must use HTTPS")
+                deployment = strip_provider_prefix(vlm_model, "azure")
+                url = (
+                    f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/chat/completions"
+                    f"?api-version={api_version}"
+                )
+                options["picture_description_api"] = {
+                    "url": url,
+                    "headers": {"api-key": api_key},
+                    "params": {
+                        "model": deployment,
+                        "max_completion_tokens": knowledge_config.vlm_max_tokens,
+                    },
+                    "prompt": prompt,
+                }
+            elif provider == "azure_ai":
+                # Azure AI Foundry, not the Azure OpenAI Service above. Which
+                # path the chat endpoint hangs off depends on which surface the
+                # operator configured, so the endpoint is classified rather
+                # than assumed — see `enhancements/providers/azure/foundry.py`.
+                # Without this branch a Foundry VLM fell through to the OpenAI
+                # default and was called with OpenAI credentials it does not
+                # have.
+                from enhancements.providers.azure import foundry
+
+                creds = config.providers.credential_values("azure_ai")
+                api_key = creds.get("api_key")
+                endpoint = foundry.normalized_api_base(creds.get("api_base"))
+                api_version = creds.get("api_version")
+                if not (api_key and endpoint):
+                    raise DoclingServeError(
+                        "Docling VLM is enabled but the Azure AI Foundry provider is not "
+                        "configured (an API key and endpoint are required)"
+                    )
+                parsed = urlparse(endpoint)
+                if parsed.scheme.lower() != "https" or not parsed.netloc:
+                    raise DoclingServeError("Azure AI Foundry VLM endpoint must use HTTPS")
+
+                profile = foundry.endpoint_profile(endpoint)
+                if profile == "unknown":
+                    raise DoclingServeError(
+                        f"Docling VLM cannot use this Azure AI Foundry endpoint. "
+                        f"{foundry.UNSUPPORTED_ENDPOINT_MESSAGE}"
+                    )
+                if profile == "legacy_deployment_uri":
+                    # A per-deployment Target URI. The gateway still routes this
+                    # shape, for installs configured before it was refused at
+                    # save time, but VLM cannot use it: the URI pins the call to
+                    # the one deployment baked into it, so the model chosen in
+                    # the picker is silently ignored. The version this API dates
+                    # itself with is dropped by normalization too, so the URL
+                    # built from it would be rejected upstream regardless —
+                    # refused here, where it can still be read as a
+                    # configuration error rather than an ingestion failure.
+                    raise DoclingServeError(
+                        f"Docling VLM cannot use this Azure AI Foundry endpoint. "
+                        f"{foundry.DEPLOYMENT_URI_MESSAGE}"
+                    )
+                chat_base = endpoint
+                if profile == "legacy_models" and not endpoint.rstrip("/").endswith("/models"):
+                    # The resource root on the legacy surface: inference hangs
+                    # off `/models`, which is what LiteLLM appends for the same
+                    # configuration. Appending it here keeps the VLM call and
+                    # the gateway call pointing at the same place.
+                    chat_base = f"{endpoint.rstrip('/')}/models"
+                url = f"{chat_base.rstrip('/')}/chat/completions"
+                # `api-version` dates the legacy API only; the v1 surface is
+                # versionless and ignores it at best.
+                if api_version and profile == "legacy_models":
+                    url = f"{url}?api-version={api_version}"
+
+                model_id = strip_provider_prefix(vlm_model, "azure_ai")
+                options["picture_description_api"] = {
+                    "url": url,
+                    "headers": {"api-key": api_key},
+                    "params": {
+                        "model": model_id,
+                        "max_completion_tokens": knowledge_config.vlm_max_tokens,
+                    },
+                    "prompt": prompt,
+                }
+            else:  # openai or default
+                openai = config.providers.openai
+                if not openai.api_key:
+                    raise DoclingServeError(
+                        "Docling VLM is enabled but the OpenAI provider is not configured"
+                    )
+                url = "https://api.openai.com/v1/chat/completions"
+                options["picture_description_api"] = {
+                    "url": url,
+                    "headers": {"Authorization": f"Bearer {openai.api_key}"},
+                    "params": {
+                        "model": vlm_model,
+                        "max_completion_tokens": knowledge_config.vlm_max_tokens,
+                    },
+                    "prompt": prompt,
+                }
+
+        return options
+
+    def _get_auth_headers(
+        self, user_id: str | None = None, auth_header: str | None = None
+    ) -> dict[str, str]:
+        """Build authentication headers for Docling Serve in saas run mode."""
+        headers = {}
+        if (is_run_mode_saas() or is_run_mode_on_prem()) and auth_header:
+            headers["Authorization"] = auth_header
+        return headers
+
+    async def upload_to_docling_direct_async(
+        self,
+        filename: str,
+        file_content: bytes,
+        user_id: str | None = None,
+        auth_header: str | None = None,
+        *,
+        ocr: bool | None = None,
+        picture_descriptions: bool | None = None,
+        preview_mode: bool = False,
+    ) -> str:
+        """
+        Upload a file to Docling Serve asynchronously using direct multipart/form-data upload.
+        """
+        from utils.upload_limits import (
+            docling_payload_too_large_message,
+            docling_rejected_size_message,
+            ensure_within_upload_limit,
+            format_byte_size,
+            max_upload_mb,
+        )
+
+        ensure_within_upload_limit(filename, len(file_content))
+        endpoint = f"{self.docling_url}/v1/convert/file/async"
+
+        options = await self._build_docling_options_async(
+            ocr_override=ocr,
+            picture_descriptions_override=picture_descriptions,
+            preview_mode=preview_mode,
+        )
+
+        headers = self._get_auth_headers(user_id, auth_header)
+
+        # Docling serve async multipart endpoint /v1/convert/file/async
+        # Options are passed as form data; dict-valued options (e.g.
+        # picture_description_local, vlm_pipeline_model_api) go as JSON strings.
+        data = {
+            k: json.dumps(v)
+            if isinstance(v, dict)
+            else str(v).lower()
+            if isinstance(v, bool)
+            else v
+            for k, v in options.items()
+        }
+
+        files = {"files": (filename, file_content)}
+
+        client = self._get_client()
+        should_close = client != self.httpx_client
+
+        try:
+            if should_close:
+                async with client:
+                    response = await client.post(
+                        endpoint,
+                        files=files,
+                        data=data,
+                        headers=headers,
+                    )
+            else:
+                response = await client.post(
+                    endpoint,
+                    files=files,
+                    data=data,
+                    headers=headers,
+                )
+
+            if response.status_code == 413:
+                size_bytes = len(file_content)
+                raise DoclingPayloadTooLarge(
+                    docling_rejected_size_message(
+                        filename, format_byte_size(size_bytes), max_upload_mb()
+                    ),
+                    operator_detail=docling_payload_too_large_message(
+                        filename, size_bytes, endpoint
+                    ),
+                )
+            response.raise_for_status()
+            task = response.json()
+            return task["task_id"]
+        except Exception as e:
+            logger.error(
+                "Docling upload failed",
+                filename=filename,
+                error=getattr(e, "operator_detail", None) or str(e),
+            )
+            raise
+
+    async def get_docling_result_async(
+        self,
+        task_id: str,
+        poll_interval: float = 1.0,
+        timeout: float = 600.0,
+        user_id: str | None = None,
+        auth_header: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Poll Docling Serve for the result of an async conversion task.
+        """
+        client = self._get_client()
+        should_close = client != self.httpx_client
+
+        try:
+            if should_close:
+                async with client:
+                    return await self._poll_result(
+                        client, task_id, poll_interval, timeout, user_id, auth_header
+                    )
+            else:
+                return await self._poll_result(
+                    client, task_id, poll_interval, timeout, user_id, auth_header
+                )
+        except Exception as e:
+            logger.error("Docling result retrieval failed", task_id=task_id, error=str(e))
+            raise
+
+    async def check_task_status(
+        self,
+        task_id: str,
+        user_id: str | None = None,
+        auth_header: str | None = None,
+    ) -> DoclingStatusSnapshot:
+        """
+        Single (non-blocking) status check against Docling Serve.
+
+        Used by the backend polling coordinator so that the polling loop lives
+        in OpenRAG and not inside Langflow. Maps the Docling Serve response
+        into a DoclingStatusSnapshot regardless of HTTP outcome.
+        """
+        client = self._get_client()
+        url = f"{self.docling_url}/v1/status/poll/{task_id}"
+        headers = self._get_auth_headers(user_id, auth_header)
+        try:
+            response = await client.get(url, headers=headers)
+        except httpx.RequestError as e:
+            # Transient network error — surface as PROCESSING so caller can
+            # retry without prematurely failing the file.
+            logger.debug("Transient error checking docling status", task_id=task_id, error=str(e))
+            return DoclingStatusSnapshot(state=DoclingTaskState.PROCESSING, detail=str(e))
+
+        if response.status_code == 404:
+            return DoclingStatusSnapshot(state=DoclingTaskState.NOT_FOUND, detail="Task not found")
+        if response.status_code >= 500:
+            logger.debug(
+                "Transient HTTP error from docling status endpoint",
+                task_id=task_id,
+                status_code=response.status_code,
+            )
+            return DoclingStatusSnapshot(
+                state=DoclingTaskState.PROCESSING,
+                detail=f"HTTP {response.status_code}",
+            )
+        if response.status_code >= 400:
+            return DoclingStatusSnapshot(
+                state=DoclingTaskState.FAILED,
+                detail=f"HTTP {response.status_code}: {response.text[:300]}",
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as e:
+            return DoclingStatusSnapshot(
+                state=DoclingTaskState.FAILED,
+                detail=f"Malformed status response: {str(e)}",
+            )
+
+        status = payload.get("task_status")
+        if status == "success":
+            return DoclingStatusSnapshot(state=DoclingTaskState.SUCCESS, raw=payload)
+        if status == "failure" or payload.get("errors") or payload.get("error"):
+            err_details = _format_docling_error(payload)
+            return DoclingStatusSnapshot(
+                state=DoclingTaskState.FAILED,
+                detail=f"Docling processing failed: {err_details}",
+                raw=payload,
+            )
+        if status in ("started", "processing", "running"):
+            return DoclingStatusSnapshot(state=DoclingTaskState.PROCESSING, raw=payload)
+        return DoclingStatusSnapshot(state=DoclingTaskState.PENDING, raw=payload)
+
+    async def fetch_task_result(
+        self,
+        task_id: str,
+        user_id: str | None = None,
+        auth_header: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Fetch the converted document for a Docling task that is already SUCCESS.
+
+        Raises:
+            DoclingServeError: if the result endpoint returns 404 (task expired
+                or unknown), an unexpected status code, or a payload missing
+                document.json_content.
+        """
+        client = self._get_client()
+        url = f"{self.docling_url}/v1/result/{task_id}"
+        headers = self._get_auth_headers(user_id, auth_header)
+        try:
+            response = await client.get(url, headers=headers)
+        except httpx.RequestError as e:
+            raise DoclingTransientError(f"Network error fetching docling result: {str(e)}") from e
+
+        if response.status_code >= 500:
+            raise DoclingTransientError(
+                f"Docling result fetch failed with HTTP {response.status_code}: {response.text[:300]}"
+            )
+        if response.status_code == 404:
+            raise DoclingServeError(
+                f"Docling result not found for task {task_id} (task expired or unknown)"
+            )
+        if response.status_code >= 400:
+            raise DoclingServeError(
+                f"Docling result fetch failed with HTTP {response.status_code}: {response.text[:300]}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as e:
+            raise DoclingServeError(f"Malformed docling result payload: {str(e)}") from e
+
+        return _extract_document_json_content(payload, task_id=task_id)
+
+    async def _poll_result(
+        self,
+        client: httpx.AsyncClient,
+        task_id: str,
+        poll_interval: float,
+        timeout: float,
+        user_id: str | None = None,
+        auth_header: str | None = None,
+    ) -> dict[str, Any]:
+        """Internal polling logic."""
+        elapsed = 0.0
+        headers = self._get_auth_headers(user_id, auth_header)
+        while elapsed < timeout:
+            try:
+                response = await client.get(
+                    f"{self.docling_url}/v1/status/poll/{task_id}", headers=headers
+                )
+                response.raise_for_status()
+                status_data = response.json()
+            except Exception as e:
+                logger.error("Error polling docling status", task_id=task_id, error=str(e))
+                raise DoclingServeError(f"Error polling docling status: {str(e)}") from e
+
+            status = status_data.get("task_status")
+
+            if status == "success":
+                logger.debug("Docling task succeeded; fetching result", task_id=task_id)
+                result_response = await client.get(
+                    f"{self.docling_url}/v1/result/{task_id}", headers=headers
+                )
+                result_response.raise_for_status()
+                result_json = result_response.json()
+
+                # A "success" task status only means the job ran; the conversion
+                # itself may still have failed, which the result body reports.
+                return _extract_document_json_content(result_json, task_id=task_id)
+            elif status == "failure" or status_data.get("errors"):
+                raise DoclingServeError(
+                    f"Docling processing failed: {_format_docling_error(status_data)}"
+                )
+
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        raise TimeoutError(f"Docling task {task_id} did not complete within {timeout} seconds")
+
+    async def convert_file(
+        self,
+        file_path: str,
+        user_id: str | None = None,
+        auth_header: str | None = None,
+        *,
+        ocr: bool | None = None,
+        picture_descriptions: bool | None = None,
+    ) -> dict[str, Any]:
+        """
+        Convert a local file via docling-serve async polling.
+        """
+        path = Path(file_path)
+        file_bytes = path.read_bytes()
+        task_id = await self.upload_to_docling_direct_async(
+            path.name,
+            file_bytes,
+            user_id=user_id,
+            auth_header=auth_header,
+            ocr=ocr,
+            picture_descriptions=picture_descriptions,
+        )
+        return await self.get_docling_result_async(
+            task_id, user_id=user_id, auth_header=auth_header
+        )
+
+    async def convert_bytes(
+        self,
+        content: bytes,
+        filename: str,
+        user_id: str | None = None,
+        auth_header: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Convert in-memory bytes via docling-serve async polling.
+        """
+        task_id = await self.upload_to_docling_direct_async(
+            filename, content, user_id=user_id, auth_header=auth_header
+        )
+        return await self.get_docling_result_async(
+            task_id, user_id=user_id, auth_header=auth_header
+        )

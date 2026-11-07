@@ -1,0 +1,592 @@
+"use client";
+
+import { useQueryClient } from "@tanstack/react-query";
+import { motion } from "framer-motion";
+import { File, Loader2 } from "lucide-react";
+import { usePathname, useRouter } from "next/navigation";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { useUpdateOnboardingStateMutation } from "@/app/api/mutations/useUpdateOnboardingStateMutation";
+import {
+  type ChatConversation,
+  useGetConversationsQuery,
+} from "@/app/api/queries/useGetConversationsQuery";
+import { getFilterById } from "@/app/api/queries/useGetFilterByIdQuery";
+import type { Settings } from "@/app/api/queries/useGetSettingsQuery";
+import { OnboardingBlocked } from "@/app/onboarding/_components/onboarding-blocked";
+import { OnboardingContent } from "@/app/onboarding/_components/onboarding-content";
+import { ProgressBar } from "@/app/onboarding/_components/progress-bar";
+import { Navigation } from "@/components/navigation";
+import { useAuth } from "@/contexts/auth-context";
+import { useIsCloudBrand } from "@/contexts/brand-context";
+import { useChat } from "@/contexts/chat-context";
+import { useSidebarOverlay } from "@/contexts/sidebar-overlay-context";
+import { useNarrowLayout } from "@/hooks/use-narrow-layout";
+import { usePermissions } from "@/hooks/use-permissions";
+import { page } from "@/lib/analytics";
+import {
+  ANIMATION_DURATION,
+  HEADER_HEIGHT,
+  SIDEBAR_HIDE_THRESHOLD,
+  SIDEBAR_MIN_WIDTH,
+  SIDEBAR_WIDTH,
+  TOTAL_ONBOARDING_STEPS,
+} from "@/lib/constants";
+import { cn } from "@/lib/utils";
+
+export function ChatRenderer({
+  settings,
+  children,
+}: {
+  settings: Settings | undefined;
+  children: React.ReactNode;
+}) {
+  const pathname = usePathname();
+  const router = useRouter();
+  const queryClient = useQueryClient(); // Move hook to component level
+  const { isAuthenticated, isNoAuthMode } = useAuth();
+  const { can, isLoading: isPermLoading, rbacEnforced } = usePermissions();
+  const isCloudBrand = useIsCloudBrand();
+  const isNarrow = useNarrowLayout();
+  const {
+    isVisible: sidebarOverlayVisible,
+    isPinned: sidebarPinned,
+    isCollapsed: sidebarCollapsed,
+    show: handleSidebarMouseEnter,
+    hide: handleSidebarMouseLeave,
+    hideNow,
+    unpin: unpinSidebar,
+    collapse: collapseSidebar,
+    expand: expandSidebar,
+  } = useSidebarOverlay();
+
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_WIDTH);
+  const [isResizeDragging, setIsResizeDragging] = useState(false);
+  const isDraggingRef = useRef(false);
+  const dragStartXRef = useRef(0);
+  const dragStartWidthRef = useRef(SIDEBAR_WIDTH);
+  const prevCollapsedRef = useRef(false);
+  if (prevCollapsedRef.current && !sidebarCollapsed && !isDraggingRef.current) {
+    setSidebarWidth(SIDEBAR_WIDTH);
+  }
+  prevCollapsedRef.current = sidebarCollapsed;
+
+  const handleResizeMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      isDraggingRef.current = true;
+      setIsResizeDragging(true);
+      hideNow();
+      dragStartXRef.current = e.clientX;
+      dragStartWidthRef.current = sidebarCollapsed ? 0 : sidebarWidth;
+
+      const onMouseMove = (ev: MouseEvent) => {
+        if (!isDraggingRef.current) return;
+        const delta = ev.clientX - dragStartXRef.current;
+        const next = dragStartWidthRef.current + delta;
+        if (next < SIDEBAR_HIDE_THRESHOLD) {
+          collapseSidebar();
+        } else {
+          expandSidebar();
+          setSidebarWidth(
+            Math.min(SIDEBAR_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, next)),
+          );
+        }
+      };
+
+      const onMouseUp = () => {
+        isDraggingRef.current = false;
+        setIsResizeDragging(false);
+        document.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("mouseup", onMouseUp);
+      };
+
+      document.addEventListener("mousemove", onMouseMove);
+      document.addEventListener("mouseup", onMouseUp);
+    },
+    [sidebarWidth, sidebarCollapsed, collapseSidebar, expandSidebar, hideNow],
+  );
+
+  const [topChromeHeight, setTopChromeHeight] = useState(0);
+
+  useLayoutEffect(() => {
+    const el = document.getElementById("app-top-chrome");
+    if (!el) return;
+    const ro = new ResizeObserver(() => setTopChromeHeight(el.offsetHeight));
+    ro.observe(el);
+    setTopChromeHeight(el.offsetHeight);
+    return () => ro.disconnect();
+  }, []);
+  const {
+    endpoint,
+    refreshTrigger,
+    refreshTriggerSilent,
+    refreshConversations,
+    startNewConversation,
+    setConversationFilter,
+    setOnboardingComplete,
+  } = useChat();
+  const [isSelectingChats, setIsSelectingChats] = useState(false);
+
+  // Initialize onboarding state from backend settings
+  const [currentStep, setCurrentStep] = useState<number>(
+    settings?.onboarding?.current_step ?? 0,
+  );
+  const [showLayout, setShowLayout] = useState<boolean>(
+    (settings?.onboarding?.current_step ?? 0) >= TOTAL_ONBOARDING_STEPS,
+  );
+
+  // Sync from settings without an extra render cycle
+  const [prevSettingsStep, setPrevSettingsStep] = useState(
+    settings?.onboarding?.current_step,
+  );
+  if (settings?.onboarding?.current_step !== prevSettingsStep) {
+    setPrevSettingsStep(settings?.onboarding?.current_step);
+    if (settings?.onboarding?.current_step !== undefined) {
+      setCurrentStep(settings.onboarding.current_step);
+      setShowLayout(settings.onboarding.current_step >= TOTAL_ONBOARDING_STEPS);
+    }
+  }
+
+  const onboardingPageTracked = useRef(false);
+  useEffect(() => {
+    if (!showLayout && !onboardingPageTracked.current) {
+      onboardingPageTracked.current = true;
+      page("OpenRAG - Onboarding Page Viewed");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showLayout]);
+
+  // Only fetch conversations on chat page
+  const isOnChatPage = pathname === "/" || pathname === "/chat";
+  const { data: conversations = [], isLoading: isConversationsLoading } =
+    useGetConversationsQuery(endpoint, refreshTrigger + refreshTriggerSilent, {
+      enabled: isOnChatPage && (isAuthenticated || isNoAuthMode),
+    }) as { data: ChatConversation[]; isLoading: boolean };
+
+  const handleNewConversation = () => {
+    refreshConversations();
+    startNewConversation();
+  };
+
+  // Navigate to /chat when onboarding is active so animation reveals chat underneath
+  useEffect(() => {
+    if (!showLayout && pathname !== "/chat" && pathname !== "/") {
+      router.push("/chat");
+    }
+  }, [showLayout, pathname, router]);
+
+  const userDocFilterId = settings?.onboarding?.user_doc_filter_id;
+  const openragDocsFilterId = settings?.onboarding?.openrag_docs_filter_id;
+
+  // Helper to store default filter ID for new conversations after onboarding
+  const storeDefaultFilterForNewConversations = useCallback(
+    async (preferUserDoc: boolean, settingsToUse?: Settings) => {
+      if (typeof window === "undefined") {
+        return;
+      }
+
+      // Check if we already have a default filter set
+      const existingDefault = localStorage.getItem(
+        "default_conversation_filter_id",
+      );
+
+      if (existingDefault) {
+        // Try to apply it to context state (don't save to localStorage to avoid overwriting)
+        try {
+          const filter = await getFilterById(existingDefault);
+          if (filter) {
+            // Pass null to skip localStorage save
+            setConversationFilter(filter, null);
+            return; // Successfully loaded and set, we're done
+          }
+        } catch (error) {
+          console.error(
+            "Failed to load existing default filter, will set new one:",
+            error,
+          );
+          // Filter doesn't exist anymore, clear it and continue to set a new one
+          localStorage.removeItem("default_conversation_filter_id");
+        }
+      }
+
+      // Try to get the appropriate filter ID from settings
+      let filterId: string | null = null;
+
+      if (preferUserDoc) {
+        // Completed full onboarding - prefer user document filter
+        filterId =
+          settingsToUse?.onboarding?.user_doc_filter_id ||
+          userDocFilterId ||
+          null;
+      }
+
+      // Fall back to OpenRAG docs filter
+      if (!filterId) {
+        filterId =
+          settingsToUse?.onboarding?.openrag_docs_filter_id ||
+          openragDocsFilterId ||
+          null;
+      }
+
+      if (filterId) {
+        // Store this as the default filter for new conversations
+        localStorage.setItem("default_conversation_filter_id", filterId);
+
+        // Apply filter to context state only (don't save to localStorage since there's no conversation yet)
+        // The default_conversation_filter_id will be used when a new conversation is started
+        try {
+          const filter = await getFilterById(filterId);
+          if (filter) {
+            // Pass null to skip localStorage save - this prevents overwriting existing conversation filters
+            setConversationFilter(filter, null);
+          }
+        } catch (error) {
+          console.error("[FILTER] Failed to set onboarding filter:", error);
+        }
+      }
+    },
+    [setConversationFilter, userDocFilterId, openragDocsFilterId],
+  );
+
+  // Note: Current step is now saved to backend via handleStepComplete
+  // No need to save on every change, only on completion
+
+  const updateOnboardingMutation = useUpdateOnboardingStateMutation();
+
+  const handleStepComplete = async () => {
+    if (currentStep < TOTAL_ONBOARDING_STEPS - 1) {
+      const nextStep = currentStep + 1;
+      setCurrentStep(nextStep);
+      // Save step to backend
+      await updateOnboardingMutation.mutateAsync({ current_step: nextStep });
+    } else {
+      // IMPORTANT: Refetch settings to get the latest filter IDs that were saved during onboarding
+      // The filter IDs are saved asynchronously by mutations, so we need fresh data
+      await queryClient.refetchQueries({ queryKey: ["settings"] });
+
+      // Get the fresh settings after refetch
+      const freshSettings = queryClient.getQueryData(["settings"]) as
+        | Settings
+        | undefined;
+
+      // Store the user document filter as default for new conversations
+      // Pass fresh settings to ensure we have the latest filter IDs
+      await storeDefaultFilterForNewConversations(true, freshSettings);
+
+      // Onboarding is complete - set step to TOTAL_ONBOARDING_STEPS to indicate completion
+      // and clear intermediate state in backend (but keep filter IDs for reference)
+      await updateOnboardingMutation.mutateAsync({
+        current_step: TOTAL_ONBOARDING_STEPS,
+        assistant_message: null,
+        selected_nudge: null,
+        card_steps: null,
+        upload_steps: null,
+        // Keep filter IDs - they're useful for reference and don't need to be cleared
+      });
+
+      // Mark onboarding as complete in context
+      setOnboardingComplete(true);
+
+      // Clear ALL conversation state so next message starts fresh
+      // This will pick up the default filter we just set
+      await startNewConversation({ showPlaceholder: false });
+
+      setShowLayout(true);
+    }
+  };
+
+  const handleStepBack = async () => {
+    if (currentStep > 0) {
+      const prevStep = currentStep - 1;
+      setCurrentStep(prevStep);
+      // Save step to backend
+      await updateOnboardingMutation.mutateAsync({ current_step: prevStep });
+    }
+  };
+
+  const handleSkipOnboarding = async () => {
+    // Skip onboarding by marking it as complete in backend
+    await updateOnboardingMutation.mutateAsync({
+      current_step: TOTAL_ONBOARDING_STEPS,
+      assistant_message: null,
+      selected_nudge: null,
+      card_steps: null,
+      upload_steps: null,
+      openrag_docs_filter_id: null,
+      user_doc_filter_id: null,
+    });
+
+    // Mark onboarding as complete in context
+    setOnboardingComplete(true);
+    // Store the OpenRAG docs filter as default for new conversations
+    await storeDefaultFilterForNewConversations(false);
+    setShowLayout(true);
+  };
+
+  // List of paths with smaller max-width (SaaS settings use full width)
+  const smallWidthPaths = isCloudBrand ? ["/upload"] : ["/upload", "/settings"];
+  const isSmallWidthPath = smallWidthPaths.some((path) =>
+    pathname.startsWith(path),
+  );
+
+  // Onboarding is admin-only. When the workspace still needs onboarding
+  // (!showLayout) and RBAC is enforced, a non-admin must not see the wizard —
+  // they get a "contact your administrator" screen instead. It renders inside
+  // the same card shell as the wizard (below), so it shares the wizard's
+  // container sizing and entrance animation. Wait for the permission set to
+  // resolve first so the wizard never flashes for them.
+  const needsOnboardingGate = !showLayout && rbacEnforced && !isNoAuthMode;
+  if (needsOnboardingGate && isPermLoading) {
+    return (
+      <div className="min-h-dvh flex items-center justify-center bg-background">
+        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+  const isOnboardingBlocked = needsOnboardingGate && !can("config:write");
+
+  return (
+    <>
+      {!isNarrow && showLayout && (
+        <div
+          className="shrink-0 overflow-hidden relative flex border-r bg-background"
+          style={{
+            width: sidebarCollapsed ? 0 : sidebarWidth,
+            transition: isDraggingRef.current ? "none" : "width 200ms ease",
+          }}
+        >
+          {!sidebarCollapsed && (
+            <>
+              <div className="h-full w-full overflow-hidden">
+                <Navigation
+                  conversations={conversations}
+                  isConversationsLoading={isConversationsLoading}
+                  onNewConversation={handleNewConversation}
+                  onSelectionChange={setIsSelectingChats}
+                />
+              </div>
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize sidebar"
+                tabIndex={0}
+                className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/20 active:bg-primary/30 focus-visible:bg-primary/40 transition-colors z-10"
+                onMouseDown={handleResizeMouseDown}
+                onKeyDown={(e) => {
+                  const STEP = 20;
+                  if (e.key === "ArrowRight") {
+                    e.preventDefault();
+                    const next = (sidebarCollapsed ? 0 : sidebarWidth) + STEP;
+                    if (next < SIDEBAR_HIDE_THRESHOLD) {
+                      collapseSidebar();
+                    } else {
+                      expandSidebar();
+                      setSidebarWidth(
+                        Math.min(
+                          SIDEBAR_WIDTH,
+                          Math.max(SIDEBAR_MIN_WIDTH, next),
+                        ),
+                      );
+                    }
+                  } else if (e.key === "ArrowLeft") {
+                    e.preventDefault();
+                    const next = (sidebarCollapsed ? 0 : sidebarWidth) - STEP;
+                    if (next < SIDEBAR_HIDE_THRESHOLD) {
+                      collapseSidebar();
+                    } else {
+                      expandSidebar();
+                      setSidebarWidth(
+                        Math.min(
+                          SIDEBAR_WIDTH,
+                          Math.max(SIDEBAR_MIN_WIDTH, next),
+                        ),
+                      );
+                    }
+                  }
+                }}
+              >
+                <div className="absolute inset-y-0 -left-1 -right-1" />
+              </div>
+            </>
+          )}
+        </div>
+      )}
+      {!isNarrow && showLayout && sidebarCollapsed && !isResizeDragging && (
+        <div
+          className="fixed left-0 bottom-0 z-40 pointer-events-none"
+          style={{ width: SIDEBAR_WIDTH, top: topChromeHeight }}
+        >
+          <nav
+            className="h-full w-full pointer-events-auto"
+            style={{
+              opacity: sidebarOverlayVisible ? 1 : 0,
+              transition: "opacity 150ms ease",
+              visibility: sidebarOverlayVisible ? "visible" : "hidden",
+            }}
+            onMouseEnter={handleSidebarMouseEnter}
+            onMouseLeave={handleSidebarMouseLeave}
+          >
+            <div className="h-full w-full border-r bg-background shadow-xl">
+              <Navigation
+                conversations={conversations}
+                isConversationsLoading={isConversationsLoading}
+                onNewConversation={handleNewConversation}
+                onSelectionChange={setIsSelectingChats}
+              />
+            </div>
+          </nav>
+        </div>
+      )}
+
+      <main
+        className={cn(
+          "overflow-auto flex-1 min-w-0 flex items-center justify-center relative",
+          isSelectingChats && "relative",
+        )}
+      >
+        {isNarrow && showLayout && (
+          <>
+            {sidebarPinned && (
+              <button
+                type="button"
+                aria-label="Close navigation"
+                className="fixed inset-0 z-30 bg-black/40 cursor-default border-0"
+                style={{ top: topChromeHeight }}
+                onClick={unpinSidebar}
+              />
+            )}
+            <div
+              className="fixed left-0 bottom-0 z-40 pointer-events-none"
+              style={{ width: SIDEBAR_WIDTH, top: topChromeHeight }}
+            >
+              <nav
+                className="h-full w-full pointer-events-auto"
+                style={{
+                  opacity: sidebarOverlayVisible ? 1 : 0,
+                  transition: "opacity 200ms ease",
+                  visibility: sidebarOverlayVisible ? "visible" : "hidden",
+                }}
+                onMouseEnter={handleSidebarMouseEnter}
+                onMouseLeave={handleSidebarMouseLeave}
+              >
+                <div className="h-full w-full border-r bg-background shadow-xl flex flex-col">
+                  <div className="flex-1 min-h-0">
+                    <Navigation
+                      conversations={conversations}
+                      isConversationsLoading={isConversationsLoading}
+                      onNewConversation={handleNewConversation}
+                      onSelectionChange={setIsSelectingChats}
+                      onNavigate={unpinSidebar}
+                    />
+                  </div>
+                </div>
+              </nav>
+            </div>
+          </>
+        )}
+        {isSelectingChats && (
+          <div className="absolute inset-0 z-10 backdrop-blur-xs bg-background/60 flex items-center justify-center">
+            <div className="flex flex-col items-center gap-3 text-center px-8">
+              <div className="p-4 rounded-xl bg-muted">
+                <File className="h-8 w-8 text-muted-foreground" />
+              </div>
+              <p className="font-semibold text-foreground">
+                Select chats to delete
+              </p>
+              <p className="text-sm text-muted-foreground max-w-72">
+                Choose conversations from the sidebar then delete them all at
+                once
+              </p>
+            </div>
+          </div>
+        )}
+        <motion.div
+          animate={
+            showLayout
+              ? { border: "0", borderRadius: "0" }
+              : {
+                  border: "1px solid hsl(var(--border))",
+                  borderRadius: isCloudBrand ? "0" : "16px",
+                }
+          }
+          transition={{
+            duration: ANIMATION_DURATION,
+            ease: "easeOut",
+          }}
+          style={
+            showLayout
+              ? { width: undefined, height: undefined }
+              : { width: "min(850px, 100vw)", height: "800px" }
+          }
+          className={cn(
+            "flex h-full w-full max-w-full max-h-full items-center justify-center overflow-auto",
+            !showLayout &&
+              "max-h-[calc(100vh-190px)] shadow-[0px_2px_4px_-2px_#0000001A,0px_4px_6px_-1px_#0000001A]",
+            showLayout && !isOnChatPage && "bg-background",
+          )}
+        >
+          <div
+            className={cn(
+              "h-full bg-background w-full min-w-0",
+              showLayout && !isOnChatPage && "p-6 container",
+              showLayout && isSmallWidthPath && "max-w-content mx-auto",
+              !showLayout && "p-0 py-2",
+            )}
+          >
+            <motion.div
+              initial={{
+                opacity: showLayout ? 1 : 0,
+              }}
+              animate={{
+                opacity: "100%",
+              }}
+              transition={{
+                duration: ANIMATION_DURATION,
+                ease: "easeOut",
+                delay: ANIMATION_DURATION,
+              }}
+              className={cn("w-full h-full")}
+              data-testid={showLayout ? "onboarding-completed" : undefined}
+            >
+              {showLayout && (
+                <div className={cn("w-full h-full", !showLayout && "hidden")}>
+                  {children}
+                </div>
+              )}
+              {!showLayout &&
+                (isOnboardingBlocked ? (
+                  <OnboardingBlocked />
+                ) : (
+                  <OnboardingContent
+                    handleStepComplete={handleStepComplete}
+                    handleStepBack={handleStepBack}
+                    currentStep={currentStep}
+                  />
+                ))}
+            </motion.div>
+          </div>
+        </motion.div>
+        {!isOnboardingBlocked && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: showLayout ? 0 : 1, y: showLayout ? 20 : 0 }}
+            transition={{ duration: ANIMATION_DURATION, ease: "easeOut" }}
+            className={cn("absolute bottom-6 left-0 right-0")}
+          >
+            <ProgressBar
+              currentStep={currentStep}
+              totalSteps={TOTAL_ONBOARDING_STEPS}
+              onSkip={handleSkipOnboarding}
+            />
+          </motion.div>
+        )}
+      </main>
+    </>
+  );
+}

@@ -1,0 +1,219 @@
+from types import SimpleNamespace
+
+import pytest
+
+from models.processors import TaskProcessor
+from services.document_index_writer import DocumentIndexWriter
+
+
+@pytest.mark.asyncio
+async def test_standard_processor_uses_shared_writer_for_embedding_mapping_and_writes(
+    tmp_path,
+    monkeypatch,
+):
+    user_client = SimpleNamespace(
+        search_calls=[],
+        index_calls=[],
+    )
+    admin_client = SimpleNamespace(bulk_calls=[], refresh_calls=[])
+    mapping_clients = []
+
+    async def search(**kwargs):
+        user_client.search_calls.append(kwargs)
+        return {"_scroll_id": None, "hits": {"hits": []}}
+
+    async def index(**kwargs):
+        user_client.index_calls.append(kwargs)
+
+    user_client.search = search
+    user_client.index = index
+
+    class Indices:
+        async def exists(self, *, index):
+            return True
+
+        async def refresh(self, *, index):
+            admin_client.refresh_calls.append({"index": index})
+
+    async def bulk(**kwargs):
+        admin_client.bulk_calls.append(kwargs)
+        return {"errors": False, "items": []}
+
+    admin_client.indices = Indices()
+    admin_client.bulk = bulk
+
+    class SessionManager:
+        def get_user_opensearch_client(self, user_id, jwt_token):
+            assert user_id == "user-1"
+            assert jwt_token == "Bearer user-token"
+            return user_client
+
+    class ModelsService:
+        async def get_litellm_model_name(self, embedding_model, provider=None):
+            assert provider == "openai"
+            return embedding_model
+
+    async def gateway_embeddings(body):
+        return {
+            "data": [
+                {"embedding": [0.1, 0.2, 0.3], "index": index}
+                for index, _ in enumerate(body["input"])
+            ]
+        }
+
+    async def ensure_embedding_field_exists(client, model_name, index_name, dimensions):
+        mapping_clients.append(client)
+        assert model_name == "openai:text-embedding-3-small"
+        assert index_name == "documents"
+        assert dimensions == 3
+        return "chunk_embedding_openai_text_embedding_3_small"
+
+    monkeypatch.setattr("config.settings.clients", SimpleNamespace(opensearch=admin_client))
+    monkeypatch.setattr("models.processors.clients", SimpleNamespace(opensearch=admin_client))
+    monkeypatch.setattr("services.llm_gateway.embeddings", gateway_embeddings)
+    monkeypatch.setattr("config.settings.get_index_name", lambda: "documents")
+    monkeypatch.setattr("models.processors.get_index_name", lambda: "documents")
+    monkeypatch.setattr(
+        "services.document_service.get_embedding_model",
+        lambda: "text-embedding-3-small",
+    )
+    monkeypatch.setattr(
+        "models.processors.get_openrag_config",
+        lambda: SimpleNamespace(
+            knowledge=SimpleNamespace(
+                embedding_model="",
+                embedding_provider="openai",
+                chunk_size=None,
+                chunk_overlap=None,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "services.document_index_writer.ensure_embedding_field_exists",
+        ensure_embedding_field_exists,
+    )
+
+    file_path = tmp_path / "doc.md"
+    file_path.write_text("# Test\n\nhello world", encoding="utf-8")
+    document_service = SimpleNamespace(
+        session_manager=SessionManager(),
+        document_index_writer=DocumentIndexWriter(opensearch_client=admin_client),
+    )
+    processor = TaskProcessor(
+        document_service=document_service,
+        models_service=ModelsService(),
+        docling_service=None,
+    )
+
+    result = await processor.process_document_standard(
+        file_path=str(file_path),
+        file_hash="file-1",
+        owner_user_id="user-1",
+        original_filename="doc.md",
+        jwt_token="Bearer user-token",
+        embedding_model="text-embedding-3-small",
+    )
+
+    assert result == {"status": "indexed", "id": "file-1"}
+    assert mapping_clients == [admin_client]
+    assert user_client.search_calls[0] == {
+        "index": "documents",
+        "body": {
+            "size": 1,
+            "_source": False,
+            "query": {"term": {"document_id": "file-1"}},
+        },
+    }
+    assert user_client.search_calls[1]["body"]["query"] == {"term": {"document_id": "file-1"}}
+    assert user_client.index_calls == []
+    assert admin_client.bulk_calls
+    bulk_body = admin_client.bulk_calls[0]["body"]
+    assert bulk_body[0]["index"]["_index"] == "documents"
+    assert bulk_body[0]["index"]["_id"].endswith("_file-1_0")
+    assert bulk_body[1]["document_id"] == "file-1"
+    assert bulk_body[1]["owner"] == "user-1"
+    assert bulk_body[1]["chunk_embedding_openai_text_embedding_3_small"] == [0.1, 0.2, 0.3]
+    assert bulk_body[1]["embedding_provider"] == "openai"
+    assert bulk_body[1]["embedding_space_id"] == "openai:text-embedding-3-small"
+
+
+@pytest.mark.asyncio
+async def test_standard_processor_routes_onprem_embeddings_through_gateway(
+    tmp_path,
+    monkeypatch,
+):
+    model = "ibm/slate-30m-english-rtrvr"
+    gateway_calls = []
+    indexed = []
+
+    async def gateway_embeddings(body):
+        gateway_calls.append(body)
+        return {
+            "data": [
+                {"embedding": [0.1, 0.2, 0.3], "index": index}
+                for index, _ in enumerate(body["input"])
+            ]
+        }
+
+    class SessionManager:
+        def get_user_opensearch_client(self, user_id, jwt_token):
+            return SimpleNamespace()
+
+    class ModelsService:
+        async def get_litellm_model_name(self, embedding_model, provider=None):
+            assert embedding_model == model
+            assert provider == "watsonx_onprem"
+            return f"watsonx_onprem/{embedding_model}"
+
+    class Writer:
+        async def index_chunks(self, context, chunks, *, final=False):
+            indexed.append((context, chunks, final))
+
+    monkeypatch.setattr(
+        "models.processors.get_openrag_config",
+        lambda: SimpleNamespace(
+            knowledge=SimpleNamespace(
+                embedding_model=model,
+                embedding_provider="watsonx_onprem",
+                chunk_size=None,
+                chunk_overlap=None,
+            )
+        ),
+    )
+    # No embedding client to stub: every provider embeds through the gateway,
+    # and reaching for one is guarded in test_embedding_calls_use_the_gateway.
+    monkeypatch.setattr("models.processors.clients", SimpleNamespace(opensearch=None))
+    monkeypatch.setattr("services.llm_gateway.embeddings", gateway_embeddings)
+
+    file_path = tmp_path / "doc.md"
+    file_path.write_text("# Test\n\nhello world", encoding="utf-8")
+    processor = TaskProcessor(
+        document_service=SimpleNamespace(
+            session_manager=SessionManager(),
+            document_index_writer=Writer(),
+        ),
+        models_service=ModelsService(),
+        docling_service=None,
+    )
+
+    async def document_missing(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(processor, "check_document_exists", document_missing)
+
+    result = await processor.process_document_standard(
+        file_path=str(file_path),
+        file_hash="file-1",
+        owner_user_id="user-1",
+        jwt_token="Bearer user-token",
+    )
+
+    assert result == {"status": "indexed", "id": "file-1"}
+    assert gateway_calls == [
+        {
+            "model": "watsonx_onprem:ibm/slate-30m-english-rtrvr",
+            "input": ["# Test\n\nhello world"],
+        }
+    ]
+    assert indexed[0][0].embedding_provider == "watsonx_onprem"
+    assert indexed[0][1][0].vector == [0.1, 0.2, 0.3]

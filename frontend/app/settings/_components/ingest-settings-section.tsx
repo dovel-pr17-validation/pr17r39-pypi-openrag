@@ -1,0 +1,1211 @@
+"use client";
+
+import { ArrowUpRight, ChevronDown, Minus, Plus } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
+import {
+  useGetIBMModelsQuery,
+  useGetModelCatalogQuery,
+  useGetOllamaModelsQuery,
+} from "@/app/api/queries/useGetModelsQuery";
+import { useGetSettingsQuery } from "@/app/api/queries/useGetSettingsQuery";
+import { getChunkSettingsError } from "@/components/cloud-picker/types";
+import { ConfirmationDialog } from "@/components/confirmation-dialog";
+import { LabelWrapper } from "@/components/label-wrapper";
+import {
+  findGroupedSelection,
+  groupedCatalogOptions,
+  LIVE_INVENTORY_PROVIDERS,
+  liveModelOption,
+  mergeLiveCatalogOptions,
+} from "@/components/models/catalog-models";
+import { ModelFeatures } from "@/components/models/model-features";
+import {
+  getModelLogo,
+  requiresExplicitModelSelection,
+} from "@/components/models/model-helpers";
+import {
+  type GroupedModelOption,
+  ModelSelector,
+} from "@/components/models/model-selector";
+import { RequirePermission } from "@/components/require-permission";
+import { Button } from "@/components/ui/button";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { Input } from "@/components/ui/input";
+import { NumberInput } from "@/components/ui/inputs/number-input";
+import { Label } from "@/components/ui/label";
+import { MultiSelect } from "@/components/ui/multi-select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
+import { useAuth } from "@/contexts/auth-context";
+import { useIsCloudBrand } from "@/contexts/brand-context";
+import { useRegisterDirty } from "@/contexts/unsaved-changes-context";
+import { trackButton } from "@/lib/analytics";
+import { apiClient } from "@/lib/api-client";
+import {
+  DEFAULT_KNOWLEDGE_SETTINGS,
+  OCR_LANGUAGE_OPTIONS,
+} from "@/lib/constants";
+import { allowedLanguages, englishLast } from "@/lib/ocr-languages";
+import { resolveLangflowEditUrl } from "@/lib/url-utils";
+import { cn } from "@/lib/utils";
+import { useUpdateSettingsMutation } from "../../api/mutations/useUpdateSettingsMutation";
+import { useRegisterSave } from "./ingest-save-context";
+import { LangflowIcon } from "./langflow-icon";
+
+const DEFAULT_WATSONX_API_VERSION = "2023-05-29";
+
+const RESPONSE_FORMATS = [
+  { value: "markdown", label: "Markdown (recommended)" },
+  { value: "doctags", label: "DocTags" },
+  { value: "html", label: "HTML" },
+] as const;
+
+export function IngestSettingsSection() {
+  const isCloudBrand = useIsCloudBrand();
+  const { isAuthenticated, isNoAuthMode, isIbmAuthMode, runMode } = useAuth();
+
+  const [isRestoringFlow, setIsRestoringFlow] = useState<boolean>(false);
+  const [userEdited, setUserEdited] = useState(false);
+
+  const [chunkSize, setChunkSize] = useState<number>(1024);
+  const [chunkOverlap, setChunkOverlap] = useState<number>(50);
+  const chunkValidationError = getChunkSettingsError({
+    chunkSize,
+    chunkOverlap,
+  });
+  const [tableStructure, setTableStructure] = useState<boolean>(true);
+  const [ocr, setOcr] = useState<boolean>(false);
+  const [ocrLanguages, setOcrLanguages] = useState<string[]>([
+    ...DEFAULT_KNOWLEDGE_SETTINGS.ocr_languages,
+  ]);
+  const [pictureDescriptions, setPictureDescriptions] =
+    useState<boolean>(false);
+  const [disableIngestWithLangflow, setDisableIngestWithLangflow] =
+    useState<boolean>(false);
+
+  const [vlmProvider, setVlmProvider] = useState<string>("");
+  const [vlmModel, setVlmModel] = useState<string>("");
+  const [vlmPrompt, setVlmPrompt] = useState<string>("");
+  const [vlmResponseFormat, setVlmResponseFormat] =
+    useState<string>("markdown");
+  const [vlmMaxTokens, setVlmMaxTokens] = useState<number>(5000);
+  const [vlmConcurrency, setVlmConcurrency] = useState<number>(4);
+  const [vlmTimeout, setVlmTimeout] = useState<number>(120);
+  const [vlmWatsonxApiVersion, setVlmWatsonxApiVersion] = useState<string>(
+    DEFAULT_WATSONX_API_VERSION,
+  );
+  const [validationError, setValidationError] = useState<string | null>(null);
+
+  const { data: settings = {} } = useGetSettingsQuery({
+    enabled: isAuthenticated || isNoAuthMode,
+  });
+
+  const showVlmSettings = settings.show_vlm_settings ?? true;
+
+  const {
+    data: catalog,
+    isLoading: catalogLoading,
+    // The catalogue query does not retry, so a failed fetch leaves the groups
+    // empty. Without this flag the selector would tell the user to configure a
+    // provider when the real problem is that the catalogue never loaded.
+    isError: catalogError,
+  } = useGetModelCatalogQuery({
+    enabled: isAuthenticated || isNoAuthMode,
+  });
+
+  const configuredProviders = useMemo(
+    () => ({
+      openai: settings.providers?.openai?.configured === true,
+      anthropic: settings.providers?.anthropic?.configured === true,
+      ollama: settings.providers?.ollama?.configured === true,
+      watsonx: settings.providers?.watsonx?.configured === true,
+      ...Object.fromEntries(
+        Object.entries(settings.providers?.custom ?? {}).map(
+          ([provider, value]) => [provider, value.configured === true],
+        ),
+      ),
+    }),
+    [settings.providers],
+  );
+
+  // watsonx and Ollama publish their inventory from the running server, not
+  // from LiteLLM's bundled table, which carries *no* embedding models for
+  // either of them — so the live list is the only thing that puts their group
+  // in this picker at all.
+  //
+  // Fetched whenever the provider is configured, never gated on it already
+  // being the selected embedding provider: the whole point of the group is to
+  // be there before you pick it. Gating on selection is why watsonx stayed
+  // missing after the first attempt at this.
+  const authed = isAuthenticated || isNoAuthMode;
+  const watsonx = settings.providers?.watsonx;
+  const ollama = settings.providers?.ollama;
+
+  const ibmModels = useGetIBMModelsQuery(
+    {
+      endpoint: watsonx?.endpoint,
+      projectId: watsonx?.project_id,
+      useEnvKey: true,
+    },
+    {
+      enabled:
+        authed &&
+        configuredProviders.watsonx &&
+        !!watsonx?.endpoint &&
+        !!watsonx?.project_id,
+    },
+  );
+  const ollamaModels = useGetOllamaModelsQuery(
+    { endpoint: ollama?.endpoint },
+    { enabled: authed && configuredProviders.ollama && !!ollama?.endpoint },
+  );
+
+  const groupedEmbeddingModels = useMemo(() => {
+    const named = (key: string) =>
+      catalog?.providers?.find((provider) => provider.key === key)?.name;
+    const liveFor = (key: string, models?: { value: string }[]) =>
+      (models ?? []).map((model) => liveModelOption(model.value, key));
+
+    let groups = groupedCatalogOptions(
+      catalog,
+      configuredProviders,
+      "embedding",
+    );
+    const liveByProvider: Record<string, { value: string }[] | undefined> = {
+      watsonx: ibmModels.data?.embedding_models,
+      ollama: ollamaModels.data?.embedding_models,
+    };
+    for (const key of LIVE_INVENTORY_PROVIDERS) {
+      groups = mergeLiveCatalogOptions(
+        groups,
+        key,
+        liveFor(key, liveByProvider[key]),
+        named(key),
+      );
+    }
+    return groups.map((group) => ({
+      group: group.group,
+      provider: group.key,
+      icon: getModelLogo("", group.key),
+      options: group.options,
+    }));
+  }, [catalog, configuredProviders, ibmModels.data, ollamaModels.data]);
+
+  const isLoadingAnyEmbeddingModels =
+    catalogLoading || ibmModels.isLoading || ollamaModels.isLoading;
+
+  const groupedVlmModels = useMemo(() => {
+    const list: GroupedModelOption[] = groupedCatalogOptions(
+      catalog,
+      configuredProviders,
+      "vision",
+    ).map((group) => ({
+      group: group.group,
+      provider: group.key,
+      icon: getModelLogo("", group.key),
+      options: group.options,
+    }));
+
+    if (settings.local_vlm_models && settings.local_vlm_models.length > 0) {
+      list.unshift({
+        group: "Local Models",
+        provider: "local",
+        icon: getModelLogo("", "local"),
+        options: settings.local_vlm_models.map((m: string) => ({
+          value: m,
+          label: m.split("/").pop() ?? m,
+          provider: "local",
+        })),
+      });
+    }
+
+    return list;
+  }, [catalog, configuredProviders, settings.local_vlm_models]);
+
+  const isLoadingAnyVlmModels = catalogLoading;
+
+  const allVlmOptions = useMemo(
+    () => groupedVlmModels.flatMap((g) => g.options),
+    [groupedVlmModels],
+  );
+
+  const knownProvider = vlmProvider || settings.knowledge?.vlm_provider;
+  const targetModel = vlmModel || settings.knowledge?.vlm_model;
+  const selectedVlmMatch = findGroupedSelection(
+    groupedVlmModels,
+    targetModel,
+    knownProvider,
+  );
+  const selectedVlmOption =
+    selectedVlmMatch?.option ||
+    (targetModel
+      ? allVlmOptions.find((o) => o.value === targetModel)
+      : undefined) ||
+    allVlmOptions[0];
+
+  const effectiveVlmProvider =
+    selectedVlmMatch?.group?.provider ||
+    selectedVlmOption?.provider ||
+    knownProvider ||
+    "";
+
+  const updateSettingsMutation = useUpdateSettingsMutation({
+    onError: (error) => {
+      toast.error("Failed to update settings", { description: error.message });
+    },
+  });
+
+  const allEmbeddingOptions = useMemo(
+    () => groupedEmbeddingModels.flatMap((g) => g.options),
+    [groupedEmbeddingModels],
+  );
+  const selectedEmbeddingMatch = findGroupedSelection(
+    groupedEmbeddingModels,
+    settings.knowledge?.embedding_model,
+    settings.knowledge?.embedding_provider,
+  );
+  const selectedEmbedding = selectedEmbeddingMatch?.option;
+  const selectedEmbeddingGroup = selectedEmbeddingMatch?.group;
+  const needsExplicitEmbeddingModel =
+    requiresExplicitModelSelection(settings.knowledge?.embedding_provider) &&
+    !settings.knowledge?.embedding_model;
+
+  const handleEmbeddingModelChange = useCallback(
+    (newModel: string, provider?: string) => {
+      const onSuccess = () => toast.success("Settings updated successfully");
+      if (newModel && provider) {
+        updateSettingsMutation.mutate(
+          { embedding_model: newModel, embedding_provider: provider },
+          { onSuccess },
+        );
+      } else if (newModel) {
+        updateSettingsMutation.mutate(
+          { embedding_model: newModel },
+          { onSuccess },
+        );
+      }
+    },
+    [updateSettingsMutation],
+  );
+
+  const autoSelectedEmbedding = useRef(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: provider changes reset the one-shot fallback guard.
+  useEffect(() => {
+    autoSelectedEmbedding.current = false;
+  }, [settings.knowledge?.embedding_provider]);
+
+  useEffect(() => {
+    if (requiresExplicitModelSelection(settings.knowledge?.embedding_provider))
+      return;
+    if (settings.knowledge?.embedding_model) {
+      autoSelectedEmbedding.current = false;
+      return;
+    }
+    if (autoSelectedEmbedding.current) return;
+    if (allEmbeddingOptions.length > 0) {
+      autoSelectedEmbedding.current = true;
+      const fallback =
+        allEmbeddingOptions.find((o) => o.default) || allEmbeddingOptions[0];
+      handleEmbeddingModelChange(fallback.value, fallback.provider);
+    }
+  }, [
+    settings.knowledge?.embedding_model,
+    settings.knowledge?.embedding_provider,
+    allEmbeddingOptions,
+    handleEmbeddingModelChange,
+  ]);
+
+  const userEditedRef = useRef(userEdited);
+  userEditedRef.current = userEdited;
+
+  useEffect(() => {
+    // Skip resync while the user has an unsaved edit in progress — otherwise
+    // a background refetch of settings.knowledge silently overwrites what
+    // they're typing before they've had a chance to save it. Read via a ref
+    // (rather than depending on userEdited directly) so this effect doesn't
+    // re-fire against stale, pre-refetch data the instant a save flips
+    // userEdited back to false. userEdited is cleared as soon as the form
+    // matches the server again (see the effect below useRegisterDirty), so a
+    // value the user edited and then reverted no longer blocks this resync.
+    if (userEditedRef.current) return;
+    const k = settings.knowledge;
+    if (!k) return;
+    if (k.chunk_size !== undefined) setChunkSize(k.chunk_size);
+    if (k.chunk_overlap !== undefined) setChunkOverlap(k.chunk_overlap);
+    if (k.table_structure !== undefined) setTableStructure(k.table_structure);
+    if (k.ocr !== undefined) setOcr(k.ocr);
+    if (k.ocr_languages !== undefined && k.ocr_languages.length > 0)
+      setOcrLanguages(englishLast(k.ocr_languages));
+    if (k.picture_descriptions !== undefined)
+      setPictureDescriptions(k.picture_descriptions);
+    if (k.disable_ingest_with_langflow !== undefined)
+      setDisableIngestWithLangflow(k.disable_ingest_with_langflow);
+    // Backend defaults vlm_model to "" and vlm_provider to "openai".
+    // Only adopt backend's vlm_provider if backend also has a configured vlm_model,
+    // so the static backend default does not clobber the locally auto-selected model's provider.
+    if (k.vlm_model) {
+      setVlmModel(k.vlm_model);
+      if (k.vlm_provider !== undefined) setVlmProvider(k.vlm_provider);
+    }
+    if (k.vlm_prompt !== undefined) setVlmPrompt(k.vlm_prompt);
+    if (k.vlm_response_format !== undefined)
+      setVlmResponseFormat(k.vlm_response_format);
+    if (k.vlm_max_tokens !== undefined) setVlmMaxTokens(k.vlm_max_tokens);
+    if (k.vlm_concurrency !== undefined) setVlmConcurrency(k.vlm_concurrency);
+    if (k.vlm_timeout !== undefined) setVlmTimeout(k.vlm_timeout);
+    if (k.vlm_watsonx_api_version !== undefined)
+      setVlmWatsonxApiVersion(k.vlm_watsonx_api_version);
+  }, [settings.knowledge]);
+
+  const [vlmOpen, setVlmOpen] = useState(false);
+  const [ocrOpen, setOcrOpen] = useState(false);
+
+  const autoSelectedVlm = useRef(false);
+  useEffect(() => {
+    if (!showVlmSettings) return;
+    // The catalogue query can resolve before the settings query. Picking a
+    // model then would lock in a choice made without knowing what the agent
+    // runs — and the ref below makes that choice permanent.
+    if (!settings.knowledge) return;
+    if (settings.knowledge.vlm_model) {
+      autoSelectedVlm.current = false;
+      return;
+    }
+    if (autoSelectedVlm.current) return;
+    if (allVlmOptions.length > 0) {
+      // Prefer the model the agent already runs on, when it can see. The
+      // catalogue is ranked by how recent an id looks, so its first vision row
+      // is whatever the provider published most recently — which for Azure is a
+      // deployment name the operator very likely does not have, since Azure
+      // serves only the deployments they created. The agent's model is one that
+      // demonstrably resolves on this account.
+      const agentModel = settings.agent?.llm_model;
+      const agentProvider = settings.agent?.llm_provider;
+      const agentVisionOption = agentModel
+        ? (allVlmOptions.find(
+            (o) => o.value === agentModel && o.provider === agentProvider,
+          ) ?? allVlmOptions.find((o) => o.value === agentModel))
+        : undefined;
+      const fallback =
+        agentVisionOption ||
+        allVlmOptions.find((o) => o.default) ||
+        allVlmOptions[0];
+      setVlmModel(fallback.value);
+      setVlmProvider(fallback.provider || "");
+      autoSelectedVlm.current = true;
+    }
+  }, [
+    showVlmSettings,
+    settings.knowledge,
+    settings.agent?.llm_model,
+    settings.agent?.llm_provider,
+    allVlmOptions,
+  ]);
+
+  const handleVlmModelChange = (value: string, provider?: string) => {
+    setUserEdited(true);
+    setVlmModel(value);
+    const resolvedProvider =
+      provider ||
+      allVlmOptions.find((o) => o.value === value)?.provider ||
+      allVlmOptions[0]?.provider ||
+      "";
+    if (resolvedProvider) setVlmProvider(resolvedProvider);
+    setValidationError(null);
+  };
+
+  const vlmModelPending =
+    showVlmSettings && pictureDescriptions && !vlmModel.trim();
+
+  const k = settings.knowledge;
+  const vlmDirty =
+    showVlmSettings &&
+    (pictureDescriptions !== (k?.vlm_enabled ?? pictureDescriptions) ||
+      effectiveVlmProvider !== (k?.vlm_provider ?? effectiveVlmProvider) ||
+      vlmModel !== (k?.vlm_model ?? vlmModel) ||
+      vlmPrompt !== (k?.vlm_prompt ?? vlmPrompt) ||
+      vlmResponseFormat !== (k?.vlm_response_format ?? vlmResponseFormat) ||
+      vlmMaxTokens !== (k?.vlm_max_tokens ?? vlmMaxTokens) ||
+      vlmConcurrency !== (k?.vlm_concurrency ?? vlmConcurrency) ||
+      vlmTimeout !== (k?.vlm_timeout ?? vlmTimeout) ||
+      vlmWatsonxApiVersion !==
+        (k?.vlm_watsonx_api_version ?? vlmWatsonxApiVersion));
+
+  // easyocr loads one recognition model per job, so a selection that mixes
+  // scripts fails at ingest time on Linux even though it works on a macOS host.
+  // Disable the incompatible rows rather than hide them, so the reason is visible.
+  const ocrLanguageOptions = useMemo(() => {
+    const allowed = new Set(allowedLanguages(ocrLanguages));
+    return OCR_LANGUAGE_OPTIONS.map((option) => ({
+      value: option.value,
+      label: option.label,
+      disabled: !allowed.has(option.value),
+      hint: allowed.has(option.value) ? undefined : "not combinable",
+    }));
+  }, [ocrLanguages]);
+
+  const knowledgeIngestDirty =
+    chunkSize !== (k?.chunk_size ?? chunkSize) ||
+    chunkOverlap !== (k?.chunk_overlap ?? chunkOverlap) ||
+    tableStructure !== (k?.table_structure ?? tableStructure) ||
+    ocr !== (k?.ocr ?? ocr) ||
+    ocrLanguages.join(",") !==
+      englishLast(k?.ocr_languages ?? ocrLanguages).join(",") ||
+    pictureDescriptions !== (k?.picture_descriptions ?? pictureDescriptions) ||
+    disableIngestWithLangflow !==
+      (k?.disable_ingest_with_langflow ?? disableIngestWithLangflow) ||
+    vlmDirty;
+
+  useRegisterDirty("ingest-settings", userEdited && knowledgeIngestDirty);
+
+  // Keep `userEdited` honest. It is set on every edit but, left alone, would
+  // stay sticky until the next successful save. If the user edits a value and
+  // then reverts it back to what the server has, the form is clean again — but
+  // a sticky flag would (a) permanently skip the resync effect above, so a
+  // genuine later server change is never picked up (stale form), and (b) let
+  // the Save button re-enable and submit that stale value. Clearing the flag
+  // the moment the form matches the server gates the resync on an *actual*
+  // unsaved difference rather than a one-way "has ever edited" flag.
+  useEffect(() => {
+    if (userEdited && !knowledgeIngestDirty) setUserEdited(false);
+  }, [userEdited, knowledgeIngestDirty]);
+
+  // Resolve through the same map that builds the groups: the catalogue now
+  // contributes custom LiteLLM providers, so a hard-coded chain would report
+  // OpenAI's state for any provider outside the four legacy keys.
+  const providerConfigured =
+    settings.providers === undefined || settings.providers === null
+      ? undefined
+      : effectiveVlmProvider === "local"
+        ? true
+        : configuredProviders[
+            effectiveVlmProvider as keyof typeof configuredProviders
+          ] === true;
+
+  const providerWarning = pictureDescriptions && providerConfigured === false;
+
+  const handleChunkSizeChange = (value: string) => {
+    setUserEdited(true);
+    setChunkSize(Math.max(0, Number.parseInt(value, 10) || 0));
+  };
+
+  const handleChunkOverlapChange = (value: string) => {
+    setUserEdited(true);
+    setChunkOverlap(Math.max(0, Number.parseInt(value, 10) || 0));
+  };
+
+  const handleKnowledgeIngestSave = async (): Promise<boolean> => {
+    // Only include VLM fields when the VLM UI is enabled; a hidden section
+    // must not drive backend VLM state or trip its validation.
+    const vlmPayload = showVlmSettings
+      ? {
+          vlm_enabled: pictureDescriptions,
+          vlm_provider: effectiveVlmProvider,
+          vlm_model:
+            (vlmModel || allVlmOptions[0]?.value || "").trim() || undefined,
+          vlm_prompt: vlmPrompt,
+          vlm_response_format: vlmResponseFormat,
+          vlm_max_tokens: vlmMaxTokens,
+          vlm_concurrency: vlmConcurrency,
+          vlm_timeout: vlmTimeout,
+          vlm_watsonx_api_version: vlmWatsonxApiVersion,
+        }
+      : {};
+
+    trackButton({
+      CTA: "Save Ingest Settings",
+      elementId: "save-ingest-settings-button",
+      namespace: "settings",
+      payload: {
+        chunk_size: chunkSize,
+        chunk_overlap: chunkOverlap,
+        table_structure: tableStructure,
+        ocr,
+        ocr_languages: ocrLanguages,
+        picture_descriptions: pictureDescriptions,
+        disable_ingest_with_langflow: disableIngestWithLangflow,
+        ...vlmPayload,
+      },
+    });
+
+    if (chunkValidationError) {
+      toast.error("Could not save ingest settings", {
+        description: chunkValidationError,
+      });
+      return false;
+    }
+
+    if (showVlmSettings && pictureDescriptions) {
+      if (!vlmModel.trim()) {
+        const msg =
+          "Model name is required when picture descriptions are enabled";
+        setValidationError(msg);
+        toast.error("Could not save ingest settings", { description: msg });
+        return false;
+      }
+      if (vlmMaxTokens < 1 || vlmConcurrency < 1 || vlmTimeout < 1) {
+        const msg = "Max tokens, concurrency, and timeout must be at least 1";
+        setValidationError(msg);
+        toast.error("Could not save ingest settings", { description: msg });
+        return false;
+      }
+    }
+
+    try {
+      await updateSettingsMutation.mutateAsync({
+        chunk_size: chunkSize,
+        chunk_overlap: chunkOverlap,
+        table_structure: tableStructure,
+        ocr,
+        ocr_languages: ocrLanguages,
+        picture_descriptions: pictureDescriptions,
+        disable_ingest_with_langflow: disableIngestWithLangflow,
+        ...vlmPayload,
+      });
+    } catch {
+      // onError already surfaced the failure; stop the combined save here.
+      return false;
+    }
+    setValidationError(null);
+    setUserEdited(false);
+    return true;
+  };
+
+  useRegisterSave("ingest-settings", {
+    isDirty: knowledgeIngestDirty,
+    blocked: vlmModelPending || !!chunkValidationError,
+    save: handleKnowledgeIngestSave,
+  });
+
+  const handleEditInLangflow = (closeDialog: () => void) => {
+    trackButton({
+      CTA: "Edit in Langflow - Ingest",
+      elementId: "edit-langflow-ingest-button",
+      namespace: "settings",
+    });
+    window.open(
+      resolveLangflowEditUrl({
+        flowId: settings.ingest_flow_id,
+        editUrlOverride: settings.langflow_ingest_edit_url,
+        publicUrl: settings.langflow_public_url,
+        langflowPort: settings.langflow_port,
+        isIbmAuthMode,
+        runMode,
+      }),
+      "_blank",
+      "noopener,noreferrer",
+    );
+    closeDialog();
+  };
+
+  const handleRestoreIngestFlow = (closeDialog: () => void) => {
+    setIsRestoringFlow(true);
+
+    trackButton({
+      CTA: "Restore Flow - Ingest",
+      elementId: "restore-ingest-flow-button",
+      namespace: "settings",
+    });
+    apiClient
+      .post("/reset-flow/ingest")
+      .then((res) => {
+        if (res.status < 200 || res.status >= 300) {
+          const body = res.data ?? {};
+          throw new Error(body.error ?? `HTTP ${res.status}`);
+        }
+        return (
+          // The flow reset above only replaces the Langflow graph. The knowledge
+          // settings (chunk size, OCR, etc.) live in a separate store, so restore
+          // must persist the defaults there too, or the form shows defaults that
+          // vanish on refresh while leaving Save stuck enabled against them.
+          updateSettingsMutation.mutateAsync({
+            chunk_size: DEFAULT_KNOWLEDGE_SETTINGS.chunk_size,
+            chunk_overlap: DEFAULT_KNOWLEDGE_SETTINGS.chunk_overlap,
+            table_structure: DEFAULT_KNOWLEDGE_SETTINGS.table_structure,
+            ocr: DEFAULT_KNOWLEDGE_SETTINGS.ocr,
+            ocr_languages: [...DEFAULT_KNOWLEDGE_SETTINGS.ocr_languages],
+            picture_descriptions:
+              DEFAULT_KNOWLEDGE_SETTINGS.picture_descriptions,
+            disable_ingest_with_langflow: false,
+          })
+        );
+      })
+      .then(() => {
+        setChunkSize(DEFAULT_KNOWLEDGE_SETTINGS.chunk_size);
+        setChunkOverlap(DEFAULT_KNOWLEDGE_SETTINGS.chunk_overlap);
+        setTableStructure(DEFAULT_KNOWLEDGE_SETTINGS.table_structure);
+        setOcr(DEFAULT_KNOWLEDGE_SETTINGS.ocr);
+        setOcrLanguages([...DEFAULT_KNOWLEDGE_SETTINGS.ocr_languages]);
+        setPictureDescriptions(DEFAULT_KNOWLEDGE_SETTINGS.picture_descriptions);
+        setDisableIngestWithLangflow(false);
+        setUserEdited(false);
+        toast.success("Default ingest flow settings restored successfully");
+        closeDialog();
+      })
+      .catch((err) => {
+        console.error("Error restoring ingest flow:", err);
+        toast.error(
+          err.message || "Failed to restore default ingest flow settings",
+        );
+        closeDialog();
+      })
+      .finally(() => setIsRestoringFlow(false));
+  };
+
+  return (
+    <section>
+      <div className="max-w-[685px] space-y-3">
+        <h3
+          className={cn(
+            "text-lg font-semibold leading-tight tracking-tight",
+            isCloudBrand && "ibm-settings-section-title",
+          )}
+        >
+          Knowledge Ingest
+        </h3>
+        <p className="text-sm text-muted-foreground">
+          Select the embedding model used to index your files. It saves as soon
+          as you pick one.
+        </p>
+      </div>
+      <div className="mt-6 space-y-2">
+        <LabelWrapper
+          helperText={
+            needsExplicitEmbeddingModel
+              ? undefined
+              : "Saves immediately when you select a model"
+          }
+          description={
+            needsExplicitEmbeddingModel
+              ? "Select or enter an Azure deployment name before ingesting files"
+              : undefined
+          }
+          id="embedding-model-select"
+          label="Embedding model"
+          required={true}
+        >
+          <ModelSelector
+            groupedOptions={groupedEmbeddingModels}
+            custom
+            noOptionsPlaceholder={
+              isLoadingAnyEmbeddingModels
+                ? "Loading models..."
+                : catalogError
+                  ? "Could not load the model catalogue. Retry later."
+                  : "No embedding models detected. Configure a provider first."
+            }
+            value={settings.knowledge?.embedding_model || ""}
+            selectedProvider={settings.knowledge?.embedding_provider}
+            onValueChange={handleEmbeddingModelChange}
+            searchPlaceholder={
+              requiresExplicitModelSelection(
+                settings.knowledge?.embedding_provider,
+              )
+                ? "Search models or type Azure deployment name"
+                : undefined
+            }
+            hasError={needsExplicitEmbeddingModel}
+          />
+        </LabelWrapper>
+        {settings.knowledge?.embedding_model && selectedEmbeddingGroup && (
+          <div className="mt-3">
+            <ModelFeatures
+              model={
+                selectedEmbedding?.model ?? {
+                  model: settings.knowledge.embedding_model,
+                  // Without an explicit mode the panel treats an
+                  // off-catalogue embedding model as a language model and
+                  // warns that it cannot run the agent tools.
+                  mode: "embedding",
+                }
+              }
+              providerName={selectedEmbeddingGroup.group}
+              provider={selectedEmbeddingGroup.provider}
+            />
+          </div>
+        )}
+      </div>
+
+      <div className="mt-8 space-y-6 border-t border-border pt-8">
+        <header className="flex items-start justify-between gap-6">
+          <div className="max-w-[545px] space-y-3">
+            <h3
+              className={cn(
+                "text-lg font-semibold leading-tight tracking-tight",
+                isCloudBrand && "ibm-settings-section-title",
+              )}
+            >
+              Langflow configuration
+            </h3>
+            <p className="text-sm text-muted-foreground">
+              Configure how files are chunked and parsed during ingest. These
+              options use Save changes. Edit in Langflow for full control.
+            </p>
+          </div>
+          <RequirePermission perm="flows:edit">
+            <div className="flex shrink-0 gap-2">
+              <ConfirmationDialog
+                trigger={
+                  <Button ignoreTitleCase={true} variant="outline">
+                    Restore flow
+                  </Button>
+                }
+                title="Restore default Ingest flow"
+                description="This restores defaults and discards all custom settings and overrides. This can't be undone."
+                confirmText="Restore"
+                variant="destructive"
+                onConfirm={handleRestoreIngestFlow}
+                isLoading={isRestoringFlow}
+              />
+              <ConfirmationDialog
+                trigger={
+                  <Button>
+                    <LangflowIcon />
+                    Edit in Langflow
+                  </Button>
+                }
+                title="Edit Ingest flow in Langflow"
+                description={
+                  <>
+                    <p className="mb-2">
+                      You&apos;re entering Langflow. You can edit the{" "}
+                      <b>Ingest flow</b> and other underlying flows. Manual
+                      changes to components, wiring, or I/O can break this
+                      experience.
+                    </p>
+                    <p className="mb-2">
+                      To enable editing, you need to unlock the flow by clicking
+                      on its name and disabling the <b>Lock flow</b> option.
+                    </p>
+                    <p>You can restore this flow from Settings.</p>
+                  </>
+                }
+                confirmText="Proceed"
+                confirmIcon={<ArrowUpRight />}
+                variant="warning"
+                onConfirm={handleEditInLangflow}
+              />
+            </div>
+          </RequirePermission>
+        </header>
+        <div className="grid grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <LabelWrapper id="chunk-size" label="Chunk size">
+              <div className="relative [&:has(input:hover):not(:has(input:focus))_button]:border-muted-foreground [&:has(input:focus)_button]:border-foreground">
+                <Input
+                  id="chunk-size"
+                  type="number"
+                  min="1"
+                  value={chunkSize}
+                  onChange={(e) => handleChunkSizeChange(e.target.value)}
+                  className={`w-full pr-20 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none${chunkValidationError ? " border-destructive" : ""}`}
+                />
+                <div className="absolute inset-y-0 right-0 flex items-center">
+                  <span className="text-sm text-placeholder-foreground mr-4 pointer-events-none">
+                    characters
+                  </span>
+                  <div className="flex flex-col">
+                    <Button
+                      aria-label="Increase value"
+                      className="h-5 rounded-l-none rounded-br-none border-input border-b-[0.5px] focus-visible:relative transition-colors"
+                      variant="outline"
+                      size="iconSm"
+                      onClick={() =>
+                        handleChunkSizeChange((chunkSize + 1).toString())
+                      }
+                    >
+                      <Plus className="text-muted-foreground" size={8} />
+                    </Button>
+                    <Button
+                      aria-label="Decrease value"
+                      className="h-5 rounded-l-none rounded-tr-none border-input border-t-[0.5px] focus-visible:relative transition-colors"
+                      variant="outline"
+                      size="iconSm"
+                      onClick={() =>
+                        handleChunkSizeChange((chunkSize - 1).toString())
+                      }
+                    >
+                      <Minus className="text-muted-foreground" size={8} />
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </LabelWrapper>
+          </div>
+          <div className="space-y-2">
+            <LabelWrapper id="chunk-overlap" label="Chunk overlap">
+              <div className="relative [&:has(input:hover):not(:has(input:focus))_button]:border-muted-foreground [&:has(input:focus)_button]:border-foreground">
+                <Input
+                  id="chunk-overlap"
+                  type="number"
+                  min="0"
+                  value={chunkOverlap}
+                  onChange={(e) => handleChunkOverlapChange(e.target.value)}
+                  className={`w-full pr-20 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none${chunkValidationError ? " border-destructive" : ""}`}
+                />
+                <div className="absolute inset-y-0 right-0 flex items-center">
+                  <span className="text-sm text-placeholder-foreground mr-4 pointer-events-none">
+                    characters
+                  </span>
+                  <div className="flex flex-col">
+                    <Button
+                      aria-label="Increase value"
+                      className="h-5 rounded-l-none rounded-br-none border-input border-b-[0.5px] focus-visible:relative transition-colors"
+                      variant="outline"
+                      size="iconSm"
+                      onClick={() =>
+                        handleChunkOverlapChange((chunkOverlap + 1).toString())
+                      }
+                    >
+                      <Plus className="text-muted-foreground" size={8} />
+                    </Button>
+                    <Button
+                      aria-label="Decrease value"
+                      className="h-5 rounded-l-none rounded-tr-none border-input border-t-[0.5px] focus-visible:relative transition-colors"
+                      variant="outline"
+                      size="iconSm"
+                      onClick={() =>
+                        handleChunkOverlapChange((chunkOverlap - 1).toString())
+                      }
+                    >
+                      <Minus className="text-muted-foreground" size={8} />
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </LabelWrapper>
+            {chunkValidationError && (
+              <p className="text-sm text-destructive mt-1" role="alert">
+                {chunkValidationError}
+              </p>
+            )}
+          </div>
+        </div>
+        {/* Toggles read as one panel in the design: a filled, rounded card
+            whose rows are split by hairlines that stop short of the card edge
+            (hence last:border-b-0). */}
+        <div className="rounded-lg bg-muted/50 px-5">
+          <div className="flex items-center justify-between gap-6 border-b border-border py-6 last:border-b-0">
+            <div className="flex-1 space-y-2 pl-3">
+              <Label
+                htmlFor="disable-ingest-with-langflow"
+                className="text-base font-semibold cursor-pointer"
+              >
+                Disable Langflow Ingestion
+              </Label>
+              <div className="text-sm text-muted-foreground">
+                Bypass Langflow for document ingestion and use traditional
+                processing.
+              </div>
+            </div>
+            <Switch
+              id="disable-ingest-with-langflow"
+              checked={disableIngestWithLangflow}
+              onCheckedChange={(v) => {
+                setUserEdited(true);
+                setDisableIngestWithLangflow(v);
+              }}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-6 border-b border-border py-6 last:border-b-0">
+            <div className="flex-1 space-y-2 pl-3">
+              <Label
+                htmlFor="table-structure"
+                className="text-base font-semibold cursor-pointer"
+              >
+                Table Structure
+              </Label>
+              <div className="text-sm text-muted-foreground">
+                Capture table structure during ingest.
+              </div>
+            </div>
+            <Switch
+              id="table-structure"
+              checked={tableStructure}
+              onCheckedChange={(v) => {
+                setUserEdited(true);
+                setTableStructure(v);
+              }}
+            />
+          </div>
+          <div className="border-b border-border last:border-b-0">
+            <div className="flex items-center justify-between gap-6 py-6">
+              <div className="flex-1 space-y-2 pl-3">
+                <Label
+                  htmlFor="ocr"
+                  className="text-base font-semibold cursor-pointer"
+                >
+                  OCR
+                </Label>
+                <div className="text-sm text-muted-foreground">
+                  Extracts text from images/PDFs. Ingest is slower when enabled.
+                </div>
+              </div>
+              <Switch
+                id="ocr"
+                checked={ocr}
+                onCheckedChange={(v) => {
+                  setUserEdited(true);
+                  setOcr(v);
+                }}
+              />
+            </div>
+            <Collapsible
+              open={ocrOpen}
+              onOpenChange={setOcrOpen}
+              className={cn(
+                "pl-3 pb-6 transition-all duration-200",
+                !ocr && "opacity-50",
+              )}
+            >
+              <CollapsibleTrigger className="flex w-full items-center justify-between py-2 text-sm font-medium text-foreground hover:text-foreground/80">
+                Advanced OCR Settings
+                <ChevronDown
+                  className={cn(
+                    "h-4 w-4 mr-4 text-muted-foreground transition-transform duration-200",
+                    ocrOpen && "rotate-180",
+                  )}
+                />
+              </CollapsibleTrigger>
+              <CollapsibleContent className="pt-4 space-y-6">
+                <div className="space-y-2">
+                  <LabelWrapper
+                    id="ocr-languages"
+                    label="OCR languages"
+                    helperText="Languages are prioritized in this order; English stays last when combined with others"
+                    disabled={!ocr}
+                    flex
+                  >
+                    <MultiSelect
+                      options={ocrLanguageOptions}
+                      value={ocrLanguages}
+                      onValueChange={(v) => {
+                        setUserEdited(true);
+                        // An empty selection would make docling fall back to its
+                        // English-only default without saying so; keep English.
+                        setOcrLanguages(englishLast(v.length > 0 ? v : ["en"]));
+                      }}
+                      showAllOption={false}
+                      placeholder="Select languages..."
+                      searchPlaceholder="Search languages..."
+                      className="w-64"
+                      inlineLabelLimit={2}
+                      disabled={!ocr}
+                    />
+                  </LabelWrapper>
+                  <p className="text-sm text-muted-foreground">
+                    Most languages can only be combined with English, so
+                    incompatible options are disabled once you choose one.
+                  </p>
+                </div>
+              </CollapsibleContent>
+            </Collapsible>
+          </div>
+          <div className="flex items-center justify-between gap-6 border-b border-border py-6 last:border-b-0">
+            <div className="flex-1 space-y-2 pl-3">
+              <Label
+                htmlFor="picture-descriptions"
+                className="text-base font-semibold cursor-pointer"
+              >
+                Picture Descriptions
+              </Label>
+              <div className="text-sm text-muted-foreground">
+                Adds captions for images. Ingest is slower when enabled.
+              </div>
+            </div>
+            <Switch
+              id="picture-descriptions"
+              checked={pictureDescriptions}
+              onCheckedChange={(v) => {
+                setUserEdited(true);
+                setPictureDescriptions(v);
+              }}
+            />
+          </div>
+        </div>
+        {showVlmSettings && (
+          <Collapsible
+            open={vlmOpen}
+            onOpenChange={setVlmOpen}
+            className={cn(
+              "px-4 transition-all duration-200",
+              !pictureDescriptions && "opacity-50",
+            )}
+          >
+            <CollapsibleTrigger className="flex w-full items-center justify-between py-2 text-sm font-medium text-foreground hover:text-foreground/80">
+              Advanced Vision Model (VLM) Settings
+              <ChevronDown
+                className={cn(
+                  "h-4 w-4 text-muted-foreground transition-transform duration-200",
+                  vlmOpen && "rotate-180",
+                )}
+              />
+            </CollapsibleTrigger>
+            <CollapsibleContent className="pt-4 space-y-6">
+              <div className="space-y-2">
+                <LabelWrapper
+                  id="vlm-model"
+                  label="Vision model"
+                  helperText="Pick a vision-capable model; the provider is set from your selection"
+                  required={pictureDescriptions}
+                >
+                  <ModelSelector
+                    groupedOptions={groupedVlmModels}
+                    custom
+                    noOptionsPlaceholder={
+                      isLoadingAnyVlmModels
+                        ? "Loading models..."
+                        : catalogError
+                          ? "Could not load the model catalogue. Retry later."
+                          : "No models detected. Configure a model provider with vision-capable models first."
+                    }
+                    value={vlmModel}
+                    selectedProvider={effectiveVlmProvider}
+                    onValueChange={handleVlmModelChange}
+                    hasError={!!validationError}
+                    disabled={!pictureDescriptions}
+                  />
+                </LabelWrapper>
+                {providerWarning && (
+                  <p className="text-sm text-destructive" role="alert">
+                    Configure a provider with vision-capable models in Settings
+                    &gt; Providers first.
+                  </p>
+                )}
+              </div>
+
+              {effectiveVlmProvider === "watsonx" && (
+                <div className="space-y-2">
+                  <LabelWrapper
+                    id="vlm-watsonx-api-version"
+                    label="watsonx API version"
+                    helperText="API version date sent to watsonx.ai"
+                  >
+                    <Input
+                      id="vlm-watsonx-api-version"
+                      type="text"
+                      placeholder={DEFAULT_WATSONX_API_VERSION}
+                      value={vlmWatsonxApiVersion}
+                      onChange={(e) => {
+                        setUserEdited(true);
+                        setVlmWatsonxApiVersion(e.target.value);
+                      }}
+                      disabled={!pictureDescriptions}
+                    />
+                  </LabelWrapper>
+                </div>
+              )}
+
+              <div className="space-y-2">
+                <LabelWrapper
+                  id="vlm-prompt"
+                  label="Prompt"
+                  helperText="Sent to the VLM for every page"
+                >
+                  <Textarea
+                    id="vlm-prompt"
+                    rows={3}
+                    value={vlmPrompt}
+                    onChange={(e) => {
+                      setUserEdited(true);
+                      setVlmPrompt(e.target.value);
+                    }}
+                    disabled={!pictureDescriptions}
+                  />
+                </LabelWrapper>
+              </div>
+
+              <div className="space-y-2">
+                <LabelWrapper
+                  id="vlm-response-format"
+                  label="Response format"
+                  helperText="Per-page VLM output. Markdown is compatible with the existing pipeline; the final document is always Docling JSON."
+                >
+                  <Select
+                    value={vlmResponseFormat}
+                    onValueChange={(v) => {
+                      setUserEdited(true);
+                      setVlmResponseFormat(v);
+                    }}
+                    disabled={!pictureDescriptions}
+                  >
+                    <SelectTrigger
+                      id="vlm-response-format"
+                      disabled={!pictureDescriptions}
+                    >
+                      <SelectValue placeholder="Select a format" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {RESPONSE_FORMATS.map((format) => (
+                        <SelectItem key={format.value} value={format.value}>
+                          {format.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </LabelWrapper>
+              </div>
+
+              <div className="grid grid-cols-3 gap-4">
+                <NumberInput
+                  id="vlm-max-tokens"
+                  label="Max tokens per page"
+                  value={vlmMaxTokens}
+                  onChange={(value) => {
+                    setUserEdited(true);
+                    setVlmMaxTokens(Math.max(1, value));
+                  }}
+                  unit="tokens"
+                  min={1}
+                  disabled={!pictureDescriptions}
+                />
+                <NumberInput
+                  id="vlm-concurrency"
+                  label="Concurrency"
+                  value={vlmConcurrency}
+                  onChange={(value) => {
+                    setUserEdited(true);
+                    setVlmConcurrency(Math.max(1, value));
+                  }}
+                  unit="requests"
+                  min={1}
+                  disabled={!pictureDescriptions}
+                />
+                <NumberInput
+                  id="vlm-timeout"
+                  label="API timeout"
+                  value={vlmTimeout}
+                  onChange={(value) => {
+                    setUserEdited(true);
+                    setVlmTimeout(Math.max(1, value));
+                  }}
+                  unit="seconds"
+                  min={1}
+                  disabled={!pictureDescriptions}
+                />
+              </div>
+
+              {validationError && (
+                <p className="text-sm text-destructive" role="alert">
+                  {validationError}
+                </p>
+              )}
+            </CollapsibleContent>
+          </Collapsible>
+        )}
+      </div>
+    </section>
+  );
+}

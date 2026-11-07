@@ -1,0 +1,136 @@
+import { getGreetingMessage } from "@/lib/greeting";
+
+export interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  input_tokens_details?: {
+    cached_tokens?: number;
+  };
+  output_tokens_details?: {
+    reasoning_tokens?: number;
+  };
+}
+
+export interface Message {
+  role: "user" | "assistant";
+  content: string;
+  timestamp: Date;
+  functionCalls?: FunctionCall[];
+  isStreaming?: boolean;
+  isGreeting?: boolean;
+  source?: "langflow" | "chat";
+  error?: boolean;
+  usage?: TokenUsage;
+}
+
+/**
+ * Stable placeholder rendered on the first paint (server and client).
+ * The content is deterministic so SSR and hydration always agree.
+ * ChatPage replaces it after mount with the real randomised greeting.
+ */
+export const PLACEHOLDER_GREETING: Message = {
+  role: "assistant",
+  isGreeting: true,
+  content: "How can I assist you today?",
+  timestamp: new Date(0),
+};
+
+/** Produce the real greeting after mount */
+export function makeInitialMessage(displayName?: string | null): Message {
+  return {
+    role: "assistant",
+    isGreeting: true,
+    content: getGreetingMessage(displayName),
+    timestamp: new Date(),
+  };
+}
+
+export interface FunctionCall {
+  name: string;
+  arguments?: Record<string, unknown>;
+  result?: Record<string, unknown> | ToolCallResult[];
+  status: "pending" | "completed" | "error";
+  argumentsString?: string;
+  id?: string;
+  type?: string;
+}
+
+export interface ToolCallResult {
+  text_key?: string;
+  data?: {
+    file_path?: string;
+    text?: string;
+    page?: number | string;
+    score?: number | string;
+    embedding_model?: string;
+    parser?: string;
+    chunk_size?: number | string;
+    chunk_overlap?: number | string;
+    metadata?: {
+      embedding_model?: string;
+      parser?: string;
+      page?: number | string;
+      score?: number | string;
+      chunk_size?: number | string;
+      chunk_overlap?: number | string;
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
+  default_value?: string;
+  chunk_id?: string;
+  id?: string;
+  filename?: string;
+  page?: number | string;
+  score?: number | string;
+  source_url?: string | null;
+  text?: string;
+  highlights?: string[];
+  embedding_model?: string;
+  parser?: string;
+  chunk_size?: number | string;
+  chunk_overlap?: number | string;
+  metadata?: {
+    embedding_model?: string;
+    parser?: string;
+    page?: number | string;
+    score?: number | string;
+    chunk_size?: number | string;
+    chunk_overlap?: number | string;
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+export interface SelectedFilters {
+  data_sources: string[];
+  document_types: string[];
+  owners: string[];
+  connector_types: string[];
+}
+
+export interface KnowledgeFilterData {
+  id: string;
+  name: string;
+  description: string;
+  query_data: string;
+  owner: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RequestBody {
+  prompt: string;
+  stream?: boolean;
+  previous_response_id?: string;
+  filters?: {
+    data_sources?: string[];
+    document_types?: string[];
+    owners?: string[];
+    connector_types?: string[];
+  };
+  filter_id?: string;
+  limit?: number;
+  scoreThreshold?: number;
+}

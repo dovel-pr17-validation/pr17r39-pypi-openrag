@@ -1,0 +1,162 @@
+import json
+from pathlib import Path
+
+
+def _load_flow(flow_path: str) -> dict:
+    return json.loads(Path(flow_path).read_text(encoding="utf-8"))
+
+
+def _opensearch_nodes(flow: dict) -> list[dict]:
+    return [
+        node
+        for node in flow["data"]["nodes"]
+        if "OpenSearchVectorStoreComponent" in node.get("data", {}).get("type", "")
+    ]
+
+
+def test_opensearch_component_returns_data_search_results():
+    code = Path("custom_components/openrag/opensearch_multimodal.py").read_text(encoding="utf-8")
+
+    assert "from lfx.schema.data import Data" in code
+    assert "def search_documents(self) -> list[Data]:" in code
+    assert "return Table(data=raw_list)" not in code
+    assert 'name="dataframe"' not in code
+    assert "def as_dataframe" not in code
+
+
+def test_embedded_opensearch_nodes_expose_json_search_results():
+    for flow_path in (
+        "flows/ingestion_flow.json",
+        "flows/openrag_nudges.json",
+        "flows/openrag_url_mcp.json",
+    ):
+        flow = _load_flow(flow_path)
+        nodes = _opensearch_nodes(flow)
+        assert nodes, f"{flow_path} has no OpenSearch nodes"
+        for node in nodes:
+            outputs = node["data"]["node"]["outputs"]
+            if any(output.get("name") == "component_as_tool" for output in outputs):
+                continue
+
+            search_output = next(
+                output for output in outputs if output.get("name") == "search_results"
+            )
+            assert search_output["method"] == "search_documents"
+            assert search_output["types"] == ["JSON"]
+            assert all(output.get("name") != "dataframe" for output in outputs)
+
+
+def test_nudges_flow_uses_opensearch_search_results_table():
+    flow = _load_flow("flows/openrag_nudges.json")
+    opensearch_node_ids = {node["id"] for node in _opensearch_nodes(flow)}
+    parser_node_ids = {
+        node["id"]
+        for node in flow["data"]["nodes"]
+        if node.get("data", {}).get("type") == "ParserComponent"
+    }
+
+    opensearch_to_parser_edges = [
+        edge
+        for edge in flow["data"]["edges"]
+        if edge.get("source") in opensearch_node_ids and edge.get("target") in parser_node_ids
+    ]
+
+    assert len(opensearch_to_parser_edges) == 1
+    source_handle = opensearch_to_parser_edges[0]["data"]["sourceHandle"]
+    assert source_handle["name"] == "search_results"
+    assert source_handle["output_types"] == ["JSON"]
+
+
+def test_parser_components_are_not_forked_for_list_data():
+    flow = _load_flow("flows/openrag_nudges.json")
+    parser_node = next(
+        node
+        for node in flow["data"]["nodes"]
+        if node.get("data", {}).get("type") == "ParserComponent"
+    )
+    code = parser_node["data"]["node"]["template"]["code"]["value"]
+
+    assert "return DataFrame(data=[item.data for item in input_data]), None" not in code
+
+
+def test_opensearch_component_fences_retrieved_text_as_untrusted():
+    """VULN-13906: retrieved chunk text must be fenced so the LLM treats it as data, not instructions."""
+    code = Path("custom_components/openrag/opensearch_multimodal.py").read_text(encoding="utf-8")
+
+    assert 'UNTRUSTED_CHUNK_FENCE_START = "<<<UNTRUSTED_DOC_CHUNK>>>"' in code
+    assert 'UNTRUSTED_CHUNK_FENCE_END = "<<<END_UNTRUSTED_DOC_CHUNK>>>"' in code
+    assert "def fence_untrusted_text(text: str) -> str:" in code
+    assert '"page_content": fence_untrusted_text(hit["_source"].get("text", ""))' in code
+    assert 'source["text"] = fence_untrusted_text(source["text"])' in code
+
+
+def test_embedded_opensearch_nodes_fence_untrusted_text():
+    """The fencing fix must be synced into every flow JSON embedding this component."""
+    py_code = Path("custom_components/openrag/opensearch_multimodal.py").read_text(encoding="utf-8")
+
+    for flow_path in (
+        "flows/ingestion_flow.json",
+        "flows/openrag_agent.json",
+        "flows/openrag_nudges.json",
+        "flows/openrag_url_mcp.json",
+    ):
+        flow = _load_flow(flow_path)
+        nodes = _opensearch_nodes(flow)
+        assert nodes, f"{flow_path} has no OpenSearch nodes"
+        for node in nodes:
+            embedded_code = node["data"]["node"]["template"]["code"]["value"]
+            assert embedded_code == py_code, (
+                f"{flow_path} node {node.get('id')} embedded code is out of sync with "
+                "custom_components/openrag/opensearch_multimodal.py — re-run "
+                "scripts/update_flow_components.py"
+            )
+
+
+def test_embedded_opensearch_nodes_bind_exact_embedding_provider():
+    for flow_path in (
+        "flows/ingestion_flow.json",
+        "flows/openrag_agent.json",
+        "flows/openrag_nudges.json",
+        "flows/openrag_url_mcp.json",
+    ):
+        flow = _load_flow(flow_path)
+        for node in _opensearch_nodes(flow):
+            provider_input = node["data"]["node"]["template"]["embedding_provider_name"]
+            assert provider_input["load_from_db"] is True
+            assert provider_input["value"] == "SELECTED_EMBEDDING_PROVIDER"
+
+
+def test_query_filter_text_input_feeds_opensearch_filter_expression():
+    """The OPENRAG-QUERY-FILTER global var must reach the retrieval component.
+
+    Regression guard: re-exporting a flow from the Langflow canvas silently drops
+    edges. When this one goes missing the retrieval tool runs unfiltered, so
+    knowledge-filter scoping leaks documents the caller excluded.
+    """
+    for flow_path in (
+        "flows/openrag_agent.json",
+        "flows/openrag_nudges.json",
+    ):
+        flow = _load_flow(flow_path)
+        query_filter_inputs = {
+            node["id"]
+            for node in flow["data"]["nodes"]
+            if node.get("data", {}).get("type") == "TextInput"
+            and node["data"]["node"]["template"].get("input_value", {}).get("value")
+            == "OPENRAG-QUERY-FILTER"
+        }
+        assert query_filter_inputs, f"{flow_path} lost its OPENRAG-QUERY-FILTER TextInput"
+
+        opensearch_node_ids = {node["id"] for node in _opensearch_nodes(flow)}
+        wired = {
+            edge["source"]
+            for edge in flow["data"]["edges"]
+            if edge.get("target") in opensearch_node_ids
+            and edge.get("data", {}).get("targetHandle", {}).get("fieldName") == "filter_expression"
+        }
+
+        assert query_filter_inputs <= wired, (
+            f"{flow_path}: OPENRAG-QUERY-FILTER TextInput is not connected to the "
+            "OpenSearch component's filter_expression input — retrieval would ignore "
+            "knowledge filters"
+        )

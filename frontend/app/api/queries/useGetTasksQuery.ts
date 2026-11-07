@@ -1,0 +1,134 @@
+import {
+  type UseQueryOptions,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { apiClient } from "@/lib/api-client";
+
+/** Component that failed, from GET /tasks/enhanced file metadata. */
+export type TaskFailureComponent =
+  | "docling"
+  | "openrag"
+  | "langflow"
+  | "opensearch";
+
+/** Pipeline or validation step where failure occurred. */
+export type TaskFailurePhase =
+  | "parsing"
+  | "chunking"
+  | "embedding"
+  | "indexing"
+  | "file_validation"
+  | "cancelled"
+  | "unknown";
+
+/** Who can resolve the failure (enhanced API). */
+export type TaskActionableBy = "USER_ACTIONABLE" | "RETRYABLE";
+
+export interface TaskFileEntry {
+  status?:
+    | "pending"
+    | "running"
+    | "processing"
+    | "completed"
+    | "skipped"
+    | "failed"
+    | "error";
+  result?: unknown;
+  error?: string;
+  retry_count?: number;
+  created_at?: string;
+  updated_at?: string;
+  duration_seconds?: number;
+  filename?: string;
+  embedding_model?: string;
+  embedding_dimensions?: number;
+  phase?: "docling" | "langflow" | "complete" | string;
+  docling_status?: string;
+  docling_task_id?: string;
+  /** Present on failed files when the enhanced API can classify the failure. */
+  component?: TaskFailureComponent;
+  failure_phase?: TaskFailurePhase;
+  user_facing_message?: string;
+  actionable_by?: TaskActionableBy;
+}
+
+export interface Task {
+  task_id: string;
+  status:
+    | "pending"
+    | "running"
+    | "processing"
+    | "completed"
+    | "skipped"
+    | "failed"
+    | "cancelled"
+    | "error";
+  total_files?: number;
+  processed_files?: number;
+  successful_files?: number;
+  failed_files?: number;
+  running_files?: number;
+  pending_files?: number;
+  created_at: string;
+  updated_at: string;
+  duration_seconds?: number;
+  result?: Record<string, unknown>;
+  error?: string;
+  files?: Record<string, TaskFileEntry>;
+  /** True when this task belongs to the shared anonymous store, not the
+   *  calling user. Shared tasks are visible to all signed-in users but can
+   *  only be bulk-cleared by the system (cleanup_old_tasks), not by any
+   *  individual user's "Clear all" action. */
+  is_shared?: boolean;
+}
+
+export interface TasksResponse {
+  tasks: Task[];
+}
+
+export const TASKS_QUERY_KEY = ["tasks", "enhanced"] as const;
+
+async function getTasks(): Promise<Task[]> {
+  const response = await apiClient.get<TasksResponse>("/tasks/enhanced");
+
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error("Failed to fetch tasks");
+  }
+
+  const data = response.data;
+  return data.tasks || [];
+}
+
+export const useGetTasksQuery = (
+  options?: Omit<UseQueryOptions<Task[]>, "queryKey" | "queryFn">,
+) => {
+  const queryClient = useQueryClient();
+
+  return useQuery(
+    {
+      queryKey: [...TASKS_QUERY_KEY],
+      queryFn: getTasks,
+      refetchInterval: (query) => {
+        const data = query.state.data;
+        if (!data || data.length === 0) {
+          return false;
+        }
+
+        const hasActiveTasks = data.some(
+          (task: Task) =>
+            task.status === "pending" ||
+            task.status === "running" ||
+            task.status === "processing",
+        );
+
+        return hasActiveTasks ? 3000 : false;
+      },
+      refetchIntervalInBackground: true,
+      staleTime: 0,
+      gcTime: 5 * 60 * 1000,
+      ...options,
+    },
+    queryClient,
+  );
+};

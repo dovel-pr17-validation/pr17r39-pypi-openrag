@@ -1,0 +1,445 @@
+---
+title: Environment variables
+slug: /reference/configuration
+---
+
+import PartialDockerComposeUp from '@site/docs/_partial-docker-compose-up.mdx';
+
+OpenRAG's `.env` file is the primary configuration file for OpenRAG.
+Environment variables in `.env` always take precedence over other sources.
+
+For deployments managed with an OpenRAG terminal session, this file is located at `~/.openrag/tui`, and it can be created automatically during [installation](/install-options).
+
+For [self-managed deployments](/docker), this file can be located at the root of your OpenRAG project directory or referenced from another location.
+
+For an example, see [`.env.example` in the OpenRAG repository](https://github.com/langflow-ai/openrag/blob/main/.env.example).
+
+:::tip
+OpenRAG's Docker Compose files are populated automatically using values from the `.env` file, so you don't need to edit the Docker Compose files manually.
+:::
+
+If a variable isn't set, OpenRAG uses default or fallback values where available.
+Not all variables have default values, and errors can occur if required variables aren't set.
+Default values can be found in the reference tables on this page and in [`config_manager.py`](https://github.com/langflow-ai/openrag/blob/main/src/config/config_manager.py), [`settings.py`](https://github.com/langflow-ai/openrag/blob/main/src/config/settings.py), and [`logging_config.py`](https://github.com/langflow-ai/openrag/blob/main/src/utils/logging_config.py).
+
+You can [temporarily set Langflow variables at runtime](/agents#modify-a-flow-at-runtime).
+However, these temporary overrides don't overlap with most OpenRAG environment variables.
+The only exceptions are flow-level Langflow settings, such as the language model used in a flow.
+
+## Edit the `.env` file and apply configuration changes {#set-environment-variables}
+
+During [installation](/install-options), you prepare an initial `.env` file.
+For terminal-managed deployments, this file is created automatically.
+For self-managed deployments, you create this file manually.
+
+After installation, you can edit the `.env` file to change your OpenRAG configuration.
+
+:::tip
+For terminal-managed deployments, many environment variables can be set through the **Reconfigure** option in the terminal session. The terminal session updates the `.env` file automatically.
+:::
+
+Most OpenRAG environment variables are mutable, and you can apply changes to these settings by [stopping and restarting the OpenRAG services](/manage-services) after editing the `.env` file.
+
+If a change doesn't take effect after restarting the services, then the variable is immutable, and you must [redeploy OpenRAG](/reinstall) with your modified `.env` file.
+This is typically only required for critical configuration changes that affect the core OpenRAG infrastructure.
+
+## Model provider settings {#model-provider-settings}
+
+Configure which models and providers OpenRAG uses to generate text and embeddings.
+You only need to provide credentials for the providers you are using in OpenRAG.
+
+These variables are initially set during the [application onboarding process](/install-uvx#application-onboarding).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMBEDDING_PROVIDER` | `openai` | Embedding model provider, as one of `openai`, `watsonx`, or `ollama`. |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model for generating vector embeddings for documents in the knowledge base and similarity search queries. Can be changed after the application onboarding process. |
+| `OPENRAG_LEGACY_EMBEDDING_PROVIDER_MAP` | `{}` | JSON object mapping model names from legacy OpenSearch documents to their original provider, for example `{"ibm/slate-125m-english-rtrvr":"watsonx"}`. Legacy `text-embedding-3-small` is inferred as OpenAI automatically. |
+| `LLM_PROVIDER` | `openai` | Language model provider, as one of `openai`, `watsonx`, `ollama`, or `anthropic`. |
+| `LLM_MODEL` | `gpt-4o-mini` | Language model for language processing and text generation in the **Chat** feature. Can be changed after the application onboarding process. |
+| `ANTHROPIC_API_KEY` | Not set | API key for the Anthropic model provider. |
+| `OPENAI_API_KEY` | Not set | API key for the OpenAI model provider, which is also the default model provider. |
+| `OLLAMA_ENDPOINT` | Not set | Custom provider endpoint for the Ollama model provider. |
+| `WATSONX_API_KEY` | Not set | API key for the IBM watsonx.ai model provider. |
+| `WATSONX_ENDPOINT` | Not set | Custom provider endpoint for the IBM watsonx.ai model provider. |
+| `WATSONX_PROJECT_ID` | Not set | Project ID for the IBM watsonx.ai model provider. |
+| `WATSONX_ENDPOINT_ONPREM` | Not set | HTTPS base URL of the IBM Cloud Pak for Data or Software Hub cluster. |
+| `WATSONX_USERNAME_ONPREM` | Not set | Cluster username used with `WATSONX_API_KEY_ONPREM`. |
+| `WATSONX_API_KEY_ONPREM` | Not set | Cluster API key exchanged with the username for CPD authorization. |
+| `WATSONX_ZEN_API_KEY_ONPREM` | Not set | Pre-encoded `base64(username:api-key)` alternative to the username and API-key variables. |
+| `WATSONX_SPACE_ID_ONPREM` | Not set | Deployment space used for inference. |
+| `WATSONX_PROJECT_ID_ONPREM` | Not set | Optional project alternative to a deployment space. Kept separate from the IBM Cloud `WATSONX_PROJECT_ID`. |
+| `WATSONX_TLS_VERIFY_ONPREM` | `false` | Provider-scoped TLS policy: `false`, `true`, or a mounted CA bundle path. `SSL_VERIFY` no longer controls this provider; `SSL_CERT_FILE` supplies the process trust store when verification is enabled. |
+| `RHOAI_ENDPOINT` | Not set | Chat endpoint for the Red Hat OpenShift AI model provider: the predictor Service of the chat `InferenceService`, ending in `/v1`. |
+| `RHOAI_EMBEDDINGS_ENDPOINT` | Not set | Embeddings endpoint for the Red Hat OpenShift AI model provider, a second `InferenceService`. Leave unset only if one endpoint serves both chat and embeddings. |
+| `RHOAI_API_KEY` | Not set | Kubernetes bearer token for the Red Hat OpenShift AI model provider, sent to both endpoints. Its subject needs `get` on `inferenceservices` in the model namespace. |
+| `RHOAI_TLS_VERIFY` | Not set | TLS trust for the Red Hat OpenShift AI endpoints. Set to a CA bundle path, such as the service-serving CA OpenShift projects into every pod (`/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt`), or `false` to skip verification for a local `oc port-forward` only. Scoped to this provider, so it does not affect other providers. |
+| `RHOAI_EMBEDDING_MAX_CONCURRENCY` | `16` | Maximum number of embedding requests OpenRAG sends to the Red Hat OpenShift AI embeddings endpoint at once; further requests wait inside OpenRAG. The default suits a GPU-served model, and also a CPU-served model whose InferenceService sets CPU requests equal to limits and `VLLM_CPU_OMP_THREADS_BIND` to the same number of cores (for example `6` and `0-5`). Without that, vLLM binds one thread per node core, the pod is CPU-throttled, and embedding takes over a second per chunk. Set `4` for such a slow endpoint: otherwise queued requests outlast the endpoint proxy's upstream timeout, which returns `502` when several files are ingested together. One slot is reserved for search and chat queries so they are not queued behind ingestion; with a limit of `1` both share it. Set `0` for no limit. Also editable in **Settings**. |
+
+Newly indexed chunks keep the model name in `embedding_model` for compatibility and also store
+`embedding_provider` plus the unambiguous `embedding_space_id` (`provider:model`). Retrieval queries
+each indexed space whose provider is configured. Chunks created before this metadata existed remain
+searchable: `text-embedding-3-small` is treated as OpenAI, while other legacy model names require
+`OPENRAG_LEGACY_EMBEDDING_PROVIDER_MAP`. If a legacy provider cannot be resolved, OpenRAG skips its
+vector query but keeps those documents eligible for keyword search.
+
+### Provider visibility per run mode {#model-provider-visibility}
+
+Which providers appear in **Settings**, in onboarding, and in the model pickers
+is not hardcoded. `src/config/model_providers.yaml` lists each provider and
+whether it is shown in each run mode, and the backend filters that list by
+`OPENRAG_RUN_MODE` (`oss`, `on_prem`, or `saas`). The UI renders whatever the
+API returns, so there is no separate frontend list to keep in step.
+
+```yaml
+providers:
+  - name: ollama
+    display_name: Ollama
+    modes:
+      oss: true
+      on_prem: true
+      saas: false # local inference is not offered in SaaS
+```
+
+A mode key that is missing means the provider is hidden, so adding a run mode
+never exposes a provider by accident. A provider the file does not list is not
+offered in the UI at all, though a model id for it can still be typed by hand if
+the gateway already routes it.
+
+The shipped defaults are:
+
+| Provider | `oss` | `on_prem` | `saas` |
+|----------|-------|-----------|--------|
+| `openai` | Yes | Yes | Yes |
+| `ollama` | Yes | Yes | No |
+| `watsonx` | Yes | Yes | Yes |
+| `anthropic` | Yes | Yes | Yes |
+| `azure_ai` | Yes | Yes | Yes |
+| `azure` | Yes | Yes | Yes |
+| `rhoai` | No | No | No |
+
+LiteLLM keys Azure twice, and the two are not interchangeable: `azure_ai` is
+the Azure AI Foundry catalogue (Llama, Phi, Mistral, Cohere, and the gpt-5.x
+entries Foundry serves), while `azure` is Azure OpenAI Service — the only one
+of the two that carries the gpt-4.1 family. Offer both unless a deployment
+uses just one.
+
+`rhoai` (Red Hat OpenShift AI) is hidden in every run mode as shipped, because
+its endpoints and token are specific to one OpenShift cluster. To offer it,
+copy `model_providers.yaml`, set `rhoai` to `true` for your run mode, point
+`OPENRAG_MODEL_PROVIDERS_CONFIG` at the copy, and restart the backend. The
+`RHOAI_*` variables above seed its credentials on first boot; the `models` and
+`embedding_models` rows on that entry are the fallback pickers until the
+cluster's own `/v1/models` listing has been read.
+
+To change what a deployment offers, edit the `modes` values and restart, or
+point `OPENRAG_MODEL_PROVIDERS_CONFIG` at your own YAML file. The file is read
+once per process, so the restart is what applies the edit; reload the console
+afterwards to pick up the new list.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENRAG_MODEL_PROVIDERS_CONFIG` | Not set | Path to a YAML file that replaces the shipped `model_providers.yaml`. If the file cannot be read, the shipped list is used. |
+
+#### Hide specific models {#exclude-models}
+
+A row can also keep ids out of the pickers. `*` and `?` wildcards work, and
+matching is against the id as the picker shows it — `gpt-3.5-turbo`, not
+`openai/gpt-3.5-turbo`. The id's last path segment is matched too, so a plain
+name also covers Azure's regional listings (`eu/gpt-5.6-luna`,
+`us/gpt-5.6-luna`); write `eu/*` to reach one region on its own.
+
+A pattern without a wildcard matches that id and nothing else, so it does **not**
+cover the provider's dated snapshots — `gpt-5.6-luna` leaves
+`gpt-5.6-luna-2026-07-09` in the picker. To suppress a model and every snapshot
+of it, end the pattern with `*`.
+
+Excluding an id hides it from the pickers and from the live
+`/models/{provider}` lists. It does not unroute it: an operator who types the
+id by hand still reaches the model. Exclusion is a curation tool, not an access
+control.
+
+Exclusions are per provider row. Azure OpenAI serves the same models as
+OpenAI, so a model you want gone from both needs the pattern on both rows.
+
+```yaml
+  - name: openai
+    display_name: OpenAI
+    modes:
+      oss: true
+    exclude_models:
+      - gpt-3.5-*      # a whole generation
+      - gpt-5.6-luna   # one model
+```
+
+Exclusion is applied last, so it also overrides a `models` entry on the same
+provider, and it covers the live `/models/{provider}` lists as well as the
+catalogue — otherwise an id hidden in Settings would reappear in onboarding.
+
+Two other mechanisms already run without configuration, so reach for
+`exclude_models` only when neither covers you:
+
+| Situation | Handled by |
+|---|---|
+| The provider has already retired the model | Dropped from the catalogue automatically |
+| The provider has announced a retirement within 90 days | Hidden behind a **Show N retiring** row in the picker |
+| This deployment does not want the model offered at all | `exclude_models` |
+
+Credentials for a provider without a purpose-built form — Azure AI Foundry
+today — are entered in **Settings** through a form built from the provider's own
+credential fields. Configuring one needs no code change beyond its row in this
+file.
+
+#### Azure AI Foundry health checks {#azure-ai-foundry-health}
+
+For `azure_ai`, a resource endpoint such as
+`https://<resource>.services.ai.azure.com/` or its `/models` form uses the
+legacy Foundry inference route. Keep that endpoint if inference is already
+working; the periodic health check uses the resource's separate
+`/openai/v1/models` listing, not `GET /models`.
+
+Explicit `/openai/v1` endpoints, including project-scoped endpoints, keep their
+configured prefix when listing models. These lightweight checks do not run
+inference or consume model tokens, and a successful listing does not prove that
+a particular deployment supports chat or tool calling.
+
+#### Add a custom OpenAI-compatible provider {#custom-openai-compatible-provider}
+
+To offer a self-hosted OpenAI-compatible endpoint — vLLM, LM Studio, or an
+internal gateway — add a row that declares the model ids it serves. The public
+vendors need no `models` list because LiteLLM already ships one, but a private
+gateway serves whatever its operator deployed, so those ids can only come from
+this file.
+
+```yaml
+  - name: openai_like
+    display_name: Internal LLM Gateway
+    modes:
+      oss: true
+      on_prem: true
+      saas: false
+    models:
+      - llama-3.3-70b-instruct
+      - qwen2.5-coder-32b
+    embedding_models:
+      - bge-m3
+```
+
+Restart, then open **Settings** and configure the new card with the gateway's
+**API base** (for example `https://gateway.internal/v1`) and API key. The
+declared models then appear in the agent and ingestion pickers, and are served
+from `/v1/models` as `openai_like:llama-3.3-70b-instruct`.
+
+Use one of LiteLLM's passthrough provider keys for `name` — `openai_like`,
+`hosted_vllm`, `lm_studio`, `llamafile`, or `custom_openai` — rather than
+inventing one. The key must be a provider LiteLLM can route, or the
+`provider:model` ids OpenRAG publishes resolve to the default provider and are
+called with the wrong credentials. A name that is not routable is logged as a
+warning when the catalogue is built.
+
+Declaring `models` on a public vendor row also works, and is how you surface a
+fine-tune or a private deployment that is not in LiteLLM's table. Ids that the
+table already lists are not duplicated.
+
+## Document processing settings {#document-processing-settings}
+
+Controls some aspects of how OpenRAG [processes and ingests documents](/ingestion) into your knowledge base.
+
+For the embedding model and Docling engine variables that you can set on the OpenRAG **Settings** page, see [Configure ingestion](/ingestion-configure).
+
+For Langflow flow IDs and Langflow timeout settings, see [Langflow settings](#langflow-settings).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DISABLE_INGEST_WITH_LANGFLOW` | `false` | Disable Langflow ingestion pipeline if you don't want to use the default [Docling Serve instance](/ingestion-configure#select-a-docling-implementation). |
+| `DOCLING_SERVE_URL` | `http://HOST_IP:5001` | URL for the [Docling Serve instance](/ingestion-configure#select-a-docling-implementation). By default, OpenRAG starts a local `docling serve` process and auto-detects the host. To use your own local or remote Docling Serve instance, set this variable to the full path to the target instance. The service must run on port 5001. |
+| `OPENRAG_DOCUMENTS_PATH` | `~/.openrag/documents` | The [local documents path](/ingestion-configure#set-the-local-documents-path) for ingestion. |
+| `HOST_DOCKER_INTERNAL` | `host.docker.internal` | Host address for accessing services running on the host machine from within Docker containers. This is used to connect to the local Docling Serve instance started by OpenRAG. If your system uses a different hostname for this purpose, set this variable accordingly. |
+| `INGESTION_TIMEOUT` | `3600` | Document ingestion timeout limit in seconds for each file. Increase this value if you experience timeouts when ingesting very large documents. Must be greater than or equal to [`LANGFLOW_TIMEOUT`](#langflow-settings).  |
+| `UPLOAD_BATCH_SIZE` | `25` | When ingesting folders, set the maximum number of files to ingest per batch. Each batch is an [ingestion task](/ingestion#monitor-ingestion). Increase this value to ingest more files per batch. If this value is too high, performance issues can occur. |
+| `OPENRAG_MAX_UPLOAD_MB` | `100` | Largest accepted upload, in mebibytes. A larger file is refused before ingestion starts, after the request body has been received. Cap the request at the reverse proxy in front of OpenRAG if temp disk must be bounded. This does not raise the body limit on the proxy in front of Docling Serve. A `proxy-body-size` annotation on the OpenRAG ingress does not change that proxy. Raise the Docling proxy's `client_max_body_size`, or set this variable to that proxy's real limit. |
+| `OPENRAG_EMBEDDING_OVERFLOW_POLICY` | `average` | What OpenRAG does when the embedding model rejects a chunk or query as longer than its input limit. With `average`, OpenRAG embeds the text in smaller pieces and stores the length-weighted average of their vectors, so ingestion continues; the full text is still stored and searchable by keyword. With `error`, the request fails and the file reports that a section is longer than the model accepts. |
+
+## Langflow settings {#langflow-settings}
+
+Configure the OpenRAG Langflow server's authentication, contact point, and built-in flow definitions.
+
+:::info
+The `LANGFLOW_SUPERUSER_PASSWORD` is set in your `.env` file, and this value determines the default values for several other Langflow authentication variables.
+
+If the `LANGFLOW_SUPERUSER_PASSWORD` variable isn't set, then the Langflow server starts _without_ authentication enabled.
+
+For better security, it is recommended to set `LANGFLOW_SUPERUSER_PASSWORD` so the [Langflow server starts with authentication enabled](https://docs.langflow.org/api-keys-and-authentication#start-a-langflow-server-with-authentication-enabled).
+:::
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LANGFLOW_DATA_PATH` | `./langflow-data` | The path where OpenRAG persists the Langflow database (flows, credentials, settings) across container restarts. |
+| `LANGFLOW_AUTO_LOGIN` | Determined by `LANGFLOW_SUPERUSER_PASSWORD` | Whether to enable [auto-login mode](https://docs.langflow.org/api-keys-and-authentication#langflow-auto-login) for the Langflow visual editor and CLI. If `LANGFLOW_SUPERUSER_PASSWORD` isn't set, then `LANGFLOW_AUTO_LOGIN` is `True` and auto-login mode is enabled. If `LANGFLOW_SUPERUSER_PASSWORD` is set, then `LANGFLOW_AUTO_LOGIN` is `False` and auto-login mode is disabled. Langflow API calls always require authentication with a Langflow API key regardless of the auto-login setting. |
+| `LANGFLOW_ENABLE_SUPERUSER_CLI` | Determined by `LANGFLOW_SUPERUSER_PASSWORD` | Whether to enable the [Langflow CLI `langflow superuser` command](https://docs.langflow.org/api-keys-and-authentication#langflow-enable-superuser-cli). If `LANGFLOW_SUPERUSER_PASSWORD` isn't set, then `LANGFLOW_ENABLE_SUPERUSER_CLI` is `True` and superuser accounts can be created with the Langflow CLI. If `LANGFLOW_SUPERUSER_PASSWORD` is set, then `LANGFLOW_ENABLE_SUPERUSER_CLI` is `False` and the `langflow superuser` command is disabled. |
+| `LANGFLOW_NEW_USER_IS_ACTIVE` | Determined by `LANGFLOW_SUPERUSER_PASSWORD` | Whether new [Langflow user accounts are active by default](https://docs.langflow.org/api-keys-and-authentication#langflow-new-user-is-active). If `LANGFLOW_SUPERUSER_PASSWORD` isn't set, then `LANGFLOW_NEW_USER_IS_ACTIVE` is `True` and new user accounts are active by default. If `LANGFLOW_SUPERUSER_PASSWORD` is set, then `LANGFLOW_NEW_USER_IS_ACTIVE` is `False` and new user accounts are inactive by default. |
+| `LANGFLOW_PORT` | `7860` | Host port for the Langflow service. Change this if port 7860 is already in use on your system. If you change this, you must also set `LANGFLOW_PUBLIC_URL` to the new port. |
+| `LANGFLOW_PUBLIC_URL` | `http://localhost:7860` | Public URL for the Langflow instance. Forms the base URL for Langflow API calls and other interfaces with your OpenRAG Langflow instance. Can also be set in the terminal's **Reconfigure** option at the **Cloud connector and advanced settings** prompt. |
+| `LANGFLOW_SECRET_KEY` | Automatically generated | Secret encryption key for Langflow internal operations. It is recommended to [generate your own Langflow secret key](https://docs.langflow.org/api-keys-and-authentication#langflow-secret-key) for this variable. If this variable isn't set, then Langflow generates a secret key automatically.  |
+| `LANGFLOW_SUPERUSER` | `admin` | Username for the Langflow administrator user. |
+| `LANGFLOW_SUPERUSER_PASSWORD` | Not set | Langflow administrator password. If this variable isn't set, then the Langflow server starts _without_ authentication enabled. It is recommended to set `LANGFLOW_SUPERUSER_PASSWORD` so the [Langflow server starts with authentication enabled](https://docs.langflow.org/api-keys-and-authentication#start-a-langflow-server-with-authentication-enabled). |
+| `LANGFLOW_CHAT_FLOW_ID`, `LANGFLOW_INGEST_FLOW_ID`, `NUDGES_FLOW_ID`, `LANGFLOW_URL_INGEST_FLOW_ID` | Built-in flow IDs | These variables are set automatically to the IDs of the chat, Docling ingestion, URL ingestion, and nudges [flows](/agents). The default values are found in [`.env.example`](https://github.com/langflow-ai/openrag/blob/main/.env.example). Only change these values if you want to replace a built-in flow with your own custom flow. The flow JSON must be present in your version of the OpenRAG codebase. For example, if you [deploy self-managed services](/docker), you can add the flow JSON to your local clone of the OpenRAG repository before deploying OpenRAG. |
+| `LANGFUSE_SECRET_KEY` | Not set | Optional Langfuse secret key to enable the [Langflow integration with Langfuse](https://docs.langflow.org/integrations-langfuse). Also used by [backend tracing](#backend-langfuse-tracing) when it's enabled. |
+| `LANGFUSE_PUBLIC_KEY` | Not set | Optional Langfuse public key to enable the [Langflow integration with Langfuse](https://docs.langflow.org/integrations-langfuse). Also used by [backend tracing](#backend-langfuse-tracing) when it's enabled. |
+| `LANGFUSE_BASE_URL` | Not set | The URL of your Langfuse instance, as shown in your Langfuse project's setup steps. For example, `https://cloud.langfuse.com` (EU), `https://us.cloud.langfuse.com` (US), or a self-hosted address. Self-hosted addresses must be relative to the OpenRAG container deployment, such as `http://localhost:3002` or `http://host.docker.internal:3000`. Langflow doesn't trace unless this is set. `LANGFUSE_HOST` is accepted as an older name for this variable. |
+| `LANGFLOW_TIMEOUT` | `2400` | Total Langflow HTTP timeout limit in seconds. Increase this value if you experience timeouts when ingesting very large PDFs. See also [`INGESTION_TIMEOUT`](#document-processing-settings).|
+| `LANGFLOW_CONNECT_TIMEOUT` | `30` | Langflow HTTP connection timeout limit in seconds. Increase this value if you experience timeouts when ingesting very large PDFs. |
+| `LANGFLOW_KEY` | Automatically generated | A Langflow API key to run flows with Langflow API calls. Because Langflow API keys are server-specific, allow OpenRAG to generate this key initially. You can create additional Langflow API keys after deploying OpenRAG. |
+| `LANGFLOW_KEY_RETRIES` | `15` | Number of retries for Langflow key generation. |
+| `LANGFLOW_KEY_RETRY_DELAY` | `2.0` | Delay between retries in seconds. |
+| `LANGFLOW_VERSION` | `OPENRAG_VERSION` | Langflow Docker image version. By default, OpenRAG uses the `OPENRAG_VERSION` for the Langflow Docker image version. **This variable is currently inactive and for information purposes only.** |
+
+## OAuth and cloud storage connector settings {#oauth-and-cloud-storage-connector-settings}
+
+Use these variables to enable OAuth mode and configure cloud storage connectors.
+You can also set these options through the terminal's **Reconfigure** option at the **Cloud connector and advanced settings** prompt.
+
+:::warning
+Additional configuration is required for these features.
+For more information, see [Configure connectors](/knowledge-connectors).
+:::
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AWS_ACCESS_KEY_ID`<br/>`AWS_SECRET_ACCESS_KEY` | Not set | Authorize OpenRAG to ingest documents from AWS S3 with an [AWS OAuth app](https://docs.aws.amazon.com/singlesignon/latest/userguide/manage-your-applications.html) integration. |
+| `GOOGLE_OAUTH_CLIENT_ID`<br/>`GOOGLE_OAUTH_CLIENT_SECRET` | Not set | Enable OAuth mode _and_ the Google Drive cloud storage connector with the [Google OAuth client](https://developers.google.com/identity/protocols/oauth2) integration. You can generate these values in the [Google Cloud Console](https://console.cloud.google.com/apis/credentials). |
+| `MICROSOFT_GRAPH_OAUTH_CLIENT_ID`<br/>`MICROSOFT_GRAPH_OAUTH_CLIENT_SECRET` | Not set | Enable the [Microsoft Graph OAuth client](https://learn.microsoft.com/en-us/onedrive/developer/rest-api/getting-started/graph-oauth) integration by providing [Azure application registration credentials for SharePoint and OneDrive](https://learn.microsoft.com/en-us/onedrive/developer/rest-api/getting-started/app-registration?view=odsp-graph-online). |
+| `WEBHOOK_BASE_URL` | Not set | Optional base URL for OAuth connector webhook endpoints. If not set, a default base URL is used. This variable is required to enable automatic cloud storage ingestion. |
+
+## Security and Encryption settings
+
+Configure cryptographic parameters and connection data isolation protocols.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENRAG_ENCRYPTION_KEY` | Not set | 32-byte Base64 AES-256-GCM master key locking all database index payloads. Automatically generated when you run the TUI or CLI configuration wizard. If left completely unset, the master encryption wrapper remains inactive and credentials remain in plaintext matrices. Warning: Cannot be lost or rotated without risking data-loss. |
+| `OPENRAG_TENANT_ID` | `openrag` | Identifier for AAD (Additional Authenticated Data) tenant binding. Ensures that encrypted files are correctly associated with the expected tenant environment. |
+| `IBM_AUTH_ENABLED` | `false` | Enabling this feature queries the IBM Secrets Manager API for your decryption keys natively. If the IBM API request is unauthorized, misconfigured, or fails, the system automatically falls back to evaluating your local `OPENRAG_ENCRYPTION_KEY`. |
+
+## OpenSearch settings
+
+Configure OpenSearch database authentication.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENSEARCH_PASSWORD` | Not set | Required. OpenSearch administrator password. Must adhere to the [OpenSearch password complexity requirements](https://docs.opensearch.org/latest/security/configuration/demo-configuration/#setting-up-a-custom-admin-password). You must set this directly in the `.env` or in the terminal's [**Reconfigure**](/install-uvx#setup) option. |
+| `OPENSEARCH_NODE_COUNT_CHECK_ENABLED` | `false` in local single-node setups; otherwise `true` | Enables the startup readiness gate that waits for the expected OpenSearch node counts. Keep this `false` for local single-node compose/dev environments. |
+| `OPENSEARCH_INDEX_NAME` | `documents` | The name of the [OpenSearch index](/knowledge#index). |
+| `OPENSEARCH_HOST` | `localhost` | OpenSearch service host. |
+| `OPENSEARCH_PORT` | `9200` | OpenSearch service port. |
+| `OPENSEARCH_USERNAME` | `admin` | OpenSearch administrator username. |
+| `OPENRAG_OPENSEARCH_NUMBER_OF_SHARDS` | `2` | Primary shard count for newly-created OpenRAG indices. Existing indices must be reindexed to change shard count. |
+| `OPENRAG_OPENSEARCH_NUMBER_OF_REPLICAS` | `2` | Replica shard count for OpenRAG indices. OpenRAG reconciles existing managed indices to this value at startup. |
+| `LANGFLOW_OPENSEARCH_HOST` | Not set | By default, OpenRAG passes the `OPENSEARCH_HOST` value to Langflow. Use the `LANGFLOW_OPENSEARCH_*` variables to set a different OpenSearch endpoint for Langflow specifically. OpenRAG itself still uses the `OPENSEARCH_HOST` value. |
+| `LANGFLOW_OPENSEARCH_PORT` | Not set | By default, OpenRAG passes the `OPENSEARCH_PORT` value to Langflow. Use the `LANGFLOW_OPENSEARCH_*` variables to set a different OpenSearch endpoint for Langflow specifically. OpenRAG itself still uses the `OPENSEARCH_PORT` value. |
+
+## Container image and registry settings {#container-image-and-registry-settings}
+
+By default, OpenRAG pulls its container images from Docker Hub under the `langflowai` organization.
+Use these variables to pull images from a private registry or an internal mirror instead, such as in an enterprise or air-gapped environment.
+
+For a complete walkthrough, including how to mirror the images, see [Deploy OpenRAG from a private registry](/docker#private-registry).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `IMAGE_REGISTRY` | `docker.io` | Registry host for the OpenRAG-owned images (`openrag-backend`, `openrag-frontend`, `openrag-langflow`, and `openrag-opensearch`). Set this to your registry hostname, and include the port if your registry uses a non-standard one, such as `registry.example.com:5000`. Don't include a scheme (`https://`) or a trailing slash. This variable doesn't affect the OpenSearch Dashboards image; use `DASHBOARDS_REGISTRY` for that image. |
+| `IMAGE_ORG` | `langflowai` | Organization or namespace that contains the OpenRAG-owned images within `IMAGE_REGISTRY`. Together, these variables form the repository path `IMAGE_REGISTRY/IMAGE_ORG/IMAGE_NAME`. For example, `IMAGE_REGISTRY=registry.example.com` and `IMAGE_ORG=platform-team` resolves the backend image to `registry.example.com/platform-team/openrag-backend`. |
+| `OPENRAG_IMAGE_TAG` | Not set | Overrides the image tag applied to all OpenRAG-owned images. When set, this variable takes precedence over `OPENRAG_VERSION`. When it isn't set, OpenRAG falls back to `OPENRAG_VERSION`, and then to `latest`. Use this variable when your mirror re-tags images and the tags don't match the OpenRAG release versions. |
+| `DASHBOARDS_REGISTRY` | `docker.io` | Registry host for the OpenSearch Dashboards image only. This lets you point Dashboards at a mirror without redirecting the OpenRAG-owned images. The repository path and tag within the registry are fixed, so the mirrored image must be available at `DASHBOARDS_REGISTRY/opensearchproject/opensearch-dashboards:3.8.0`. |
+
+:::important
+These variables are read by Docker Compose, so they apply to [self-managed deployments](/docker).
+Terminal-managed deployments read them from `~/.openrag/tui/.env`, where they determine which images the terminal session treats as OpenRAG-owned when it pulls or cleans up images.
+
+Setting `IMAGE_REGISTRY` to a host other than `docker.io` also disables the terminal session's update check, because that check queries the Docker Hub API. The **Status** page reports neither an available upgrade nor an up-to-date confirmation. Track new releases through your registry or the [OpenRAG releases page](https://github.com/langflow-ai/openrag/releases) instead.
+
+Kubernetes deployments don't use these variables. The Helm charts in [`kubernetes/helm`](https://github.com/langflow-ai/openrag/tree/main/kubernetes/helm) configure images through their own `global.imageRegistry`, `global.imageTag`, and `global.imagePullSecrets` values. Note that the chart's `global.imageRegistry` value holds the organization (`langflowai` by default), which is the equivalent of `IMAGE_ORG` rather than `IMAGE_REGISTRY`.
+:::
+
+## System settings
+
+Configure general system components, session management, and logging.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FRONTEND_PORT` | `3000` | Host port for the OpenRAG frontend web interface. Change this if port 3000 is already in use on your system. |
+| `OPENRAG_FRONTEND_BASE_PATH` | Not set | Optional URL path below which the complete frontend is served, such as `/openrag-fe`. This is a frontend **build-time** setting; rebuild the frontend image after changing it. |
+| `OPENRAG_VERSION` | `latest` | The version of the OpenRAG Docker images to run. If [`OPENRAG_IMAGE_TAG`](#container-image-and-registry-settings) is set, it takes precedence over this variable. For more information, see [Upgrade OpenRAG](/upgrade) |
+| `NEXT_ALLOWED_DEV_ORIGINS` | `http://localhost:3000` | Only used when [running OpenRAG in development mode](/support/contribute). Accepts a comma-separated list of hostnames to allow additional origins to make requests to the Next.js development server. |
+| `MAX_WORKERS` | `min(4, CPU_COUNT // 2)` | Number of Backend worker processes for concurrent request handling.  Be mindful of hardware limitations to avoid overtaxing system resources. |
+| `LANGFLOW_WORKERS` | `1` | Number of Langflow worker processes for concurrent request handling. Be mindful of hardware limitations to avoid overtaxing system resources. |
+| `DOCLING_WORKERS` | `1` | Number of Docling worker processes for concurrent request handling. Be mindful of hardware limitations to avoid overtaxing system resources. |
+| `ACCESS_LOG` | `true` | Whether to enable access logging for OpenRAG services, such as `INFO: 127.0.0.1:45132 - "GET /tasks HTTP/1.1" 200 OK`. Access logs provide information about incoming requests, and they can be useful for monitoring and debugging. |
+| `LOG_FORMAT` | `json` | Set to `json` to enable JSON-formatted log output, or `text` for standard text logs. |
+| `LOG_LEVEL` | `INFO` | Logging level. Can be one of `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. `DEBUG` provides the most detailed logs but can impact performance. |
+| `SERVICE_NAME` | `openrag` | Service name used in log entries. |
+| `SESSION_SECRET` | Automatically generated | Secret key for session management. If not provided, a secure random key is generated automatically. |
+
+## Observability and APM settings {#observability-and-apm-settings}
+
+Instrument OpenRAG Backend with [IBM Instana](https://www.ibm.com/products/instana) for application performance monitoring and distributed tracing.
+Instrumentation is off by default.
+
+For a complete walkthrough, including how to obtain an agent key and how to configure Kubernetes deployments, see [Monitor OpenRAG with IBM Instana](/reference/observability).
+
+The first group configures OpenRAG Backend, which sends traces to an Instana host agent.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INSTANA_ENABLED` | `false` | Whether to load the Instana Python tracer in OpenRAG Backend. Accepts `true`, `1`, or `yes` to enable. This variable is read once at process start, so the backend must be restarted for a change to take effect. The tracer is an optional dependency: the backend container image includes it, and a backend run from source needs `uv sync --extra apm`. If it isn't installed, the backend logs a warning and runs untraced. |
+| `INSTANA_AGENT_HOST` | `host.docker.internal` for containerized deployments; `localhost` for a backend that runs directly on the host | Address of the Instana host agent that the tracer sends spans to. In Kubernetes, leave this unset. The Helm chart and the operator inject the pod's own node IP, which is the address of the per-node agent DaemonSet. |
+| `INSTANA_AGENT_PORT` | `42699` | Port of the Instana host agent. |
+| `INSTANA_SERVICE_NAME` | Not set | Service name that OpenRAG Backend reports to Instana, shown in the **Applications** and **Analyze Traces** views. Leave this unset rather than setting it to an empty value, because the tracer checks it for presence rather than for a value, and an empty value registers a service with a blank name. |
+| `INSTANA_ZONE` | Not set | Custom zone that the host and process are grouped under in the Instana **Infrastructure** view. Presence-sensitive in the same way as `INSTANA_SERVICE_NAME`. |
+| `INSTANA_LOG_LEVEL` | `info` | Verbosity of the tracer's own logging, as one of `debug`, `info`, `warn`, or `error`. This is unrelated to [`LOG_LEVEL`](#system-settings), which controls OpenRAG's application logs. Presence-sensitive in the same way as `INSTANA_SERVICE_NAME`: an empty value logs an `Unknown INSTANA_LOG_LEVEL` warning on every start. |
+| `INSTANA_SECRETS` | `regex:.*key.*,.*pass.*,.*secret.*,.*token.*,q\Z,search\Z,filename\Z` | Query-string parameters that the tracer replaces with `<redacted>` before a span is sent, as `<matcher>:<name>[,<name>]` where the matcher is one of `equals`, `equals-ignore-case`, `contains`, `contains-ignore-case`, or `regex`. OpenRAG sets this rather than leaving it at the tracer's own `contains-ignore-case:key,pass,secret`, which only covers credential-shaped parameter names and not free-text ones such as the `q` of `GET /v2/files/search`. See [Redact query parameters](/reference/observability#redact-query-parameters). |
+| `INSTANA_TRACING_DISABLE` | `logging` | Span categories or types that the tracer skips, as a comma-separated list, or `true` to disable tracing entirely. OpenRAG sets `logging` rather than leaving it empty, because a logging span is created for every `WARNING` and `ERROR` logged inside a request trace, at a cost that grows for as long as the process runs. See [Performance guardrails](/reference/observability#performance-guardrails). |
+| `INSTANA_STACK_TRACE` | `error` | When the tracer captures a Python stack trace for an exit span, as one of `all`, `error`, or `none`. OpenRAG sets `error` rather than the tracer's own `all`, which captures a full stack on every outbound HTTP call, OpenSearch query, and database query. Any other value logs a warning and falls back to `all`, so use `all` to opt out rather than an empty value. See [Performance guardrails](/reference/observability#performance-guardrails). |
+| `INSTANA_STACK_TRACE_LENGTH` | `30` | Maximum number of frames kept in a captured stack trace, between 1 and 40. Only has an effect when `INSTANA_STACK_TRACE` captures a stack. |
+
+The second group configures the optional local Instana host agent that `make instana-agent-up` starts.
+These variables don't affect the backend, and they aren't used by Kubernetes deployments, where the agent is installed separately as a DaemonSet.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INSTANA_AGENT_KEY` | Not set | Agent key for your Instana tenant, from **Infrastructure > Add a Host** in the Instana UI. Required by `make instana-agent-up`, which fails if the key isn't set. |
+| `INSTANA_AGENT_ENDPOINT` | `ingress-coral-saas.instana.io` | Ingress endpoint that the host agent forwards data to. This value is region-specific, so use the endpoint that your tenant's **Add a Host** wizard shows rather than the default. |
+| `INSTANA_AGENT_ENDPOINT_PORT` | `443` | Port of the ingress endpoint. |
+| `INSTANA_AGENT_IMAGE_TAG` | `1.323.1` | Tag of the `icr.io/instana/agent` image that the local host agent runs. The tag is pinned rather than tracked on `latest` because the agent container runs privileged. For available tags, see [the agent's tag list](https://icr.io/v2/instana/agent/tags/list). |
+
+:::warning
+`make instana-agent-up` starts a privileged container in the host PID namespace with access to the Docker socket, which is effectively root access to the host.
+It's intended for local development machines only. Don't run it on a shared or production host.
+:::
+
+### Backend tracing with Langfuse {#backend-langfuse-tracing}
+
+OpenRAG Backend can send a trace to [Langfuse](https://langfuse.com) for every model call it makes, both embeddings and chat completions, for every provider.
+This includes calls that Langflow flows make through the backend's model gateway.
+Each trace records the model, provider, latency, token usage, cost where the provider reports it, and the error for failed calls.
+
+Backend tracing is off by default. It uses the same `LANGFUSE_*` keys as the [Langflow integration with Langfuse](#langflow-settings), so backend and Langflow traces land in the same Langfuse project.
+
+To enable it, set the Langfuse keys and `OPENRAG_TRACING_ENABLED=true` in your `.env` file, then [restart the OpenRAG services](/manage-services):
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com  # or https://us.cloud.langfuse.com, or your self-hosted URL
+OPENRAG_TRACING_ENABLED=true
+```
+
+In Kubernetes, set `backend.tracing.enabled: true` in the Helm chart, which reuses the keys under `langflow.langfuse`. With the operator, set the same variables in the backend's `spec.env`.
+
+By default, traces carry metadata only. Prompts, completions, and the document text sent for embedding are replaced with `redacted-by-litellm` before the trace leaves the backend.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENRAG_TRACING_ENABLED` | `false` | Whether OpenRAG Backend sends traces to Langfuse. Requires `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`. If either key is missing, the backend logs a warning and runs untraced. The tracing dependencies are an optional extra: the backend container image includes them, and a backend run from source needs `uv sync --extra tracing`. Read at startup, so changes require a backend restart. |
+| `OPENRAG_TRACING_CAPTURE_CONTENT` | `false` | Whether traces include prompts, completions, and embedding inputs. Embedding inputs are your document text, so enable this only when that content may leave your deployment. |
+| `OPENRAG_TRACING_ALLOW_CONTENT_IN_SAAS` | `false` | In `OPENRAG_RUN_MODE=saas`, content capture also requires this variable. Has no effect in other run modes. |

@@ -1,0 +1,128 @@
+"use client";
+
+import type { ModelProvider } from "@/components/models/model-helpers";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useIsCloudBrand } from "@/contexts/brand-context";
+import { trackButton } from "@/lib/analytics";
+import { cn } from "@/lib/utils";
+import CardIcon from "./card-icon";
+
+export interface ModelProviderCardData {
+  providerKey: ModelProvider;
+  name: string;
+  logo: (props: React.SVGProps<SVGSVGElement>) => React.ReactNode;
+  logoColor: string;
+  logoBgColor: string;
+  badge?: string;
+}
+
+interface ModelProviderCardProps {
+  provider: ModelProviderCardData;
+  isConfigured: boolean;
+  isUnhealthy: boolean;
+  onConfigure: (providerKey: ModelProvider) => void;
+}
+
+export default function ModelProviderCard({
+  provider,
+  isConfigured,
+  isUnhealthy,
+  onConfigure,
+}: ModelProviderCardProps) {
+  const isCloudBrand = useIsCloudBrand();
+  const {
+    providerKey,
+    name,
+    logo: Logo,
+    logoColor,
+    logoBgColor,
+    badge,
+  } = provider;
+  const isEditSetup = isConfigured && !isUnhealthy;
+
+  return (
+    <Card
+      data-testid={`model-provider-card-${providerKey}`}
+      className={cn(
+        "group relative flex flex-col transition-colors",
+        isCloudBrand
+          ? "rounded-none border-0 bg-layer-contextual text-layer-contextual-foreground shadow-none"
+          : "hover:bg-secondary-hover hover:border-muted-foreground",
+        !isConfigured && !isCloudBrand && "text-muted-foreground",
+        !isConfigured && isCloudBrand && "text-layer-contextual-foreground/70",
+        isUnhealthy &&
+          (isCloudBrand ? "ring-2 ring-destructive" : "border-destructive"),
+      )}
+    >
+      {badge && (
+        <span className="absolute right-4 top-4 rounded border border-muted-foreground/40 bg-muted px-2 py-0.5 text-xs font-medium text-muted-foreground">
+          {badge}
+        </span>
+      )}
+      <CardHeader>
+        <div className="flex flex-col items-start justify-between">
+          <div className="flex flex-col gap-3">
+            <div className="mb-1">
+              <CardIcon isActive={isConfigured} activeBgColor={logoBgColor}>
+                <Logo
+                  className={isConfigured ? logoColor : "text-muted-foreground"}
+                />
+              </CardIcon>
+            </div>
+            <CardTitle
+              className={cn(
+                "flex flex-row items-center gap-2",
+                isCloudBrand && "text-layer-contextual-foreground",
+              )}
+            >
+              {name}
+              {isUnhealthy && (
+                <span className="h-2 w-2 rounded-full bg-destructive" />
+              )}
+            </CardTitle>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="flex-1 flex flex-col justify-end space-y-4">
+        <Button
+          className={cn(
+            isConfigured && !isCloudBrand && "border-primary",
+            isCloudBrand &&
+              isEditSetup &&
+              "rounded-none border border-layer-contextual-foreground bg-layer-contextual text-layer-contextual-foreground shadow-none hover:bg-layer-contextual hover:text-layer-contextual-foreground",
+            isCloudBrand && !isEditSetup && !isUnhealthy && "rounded-none",
+            isUnhealthy && isCloudBrand && "rounded-none",
+          )}
+          variant={
+            isUnhealthy
+              ? "default"
+              : isCloudBrand && isEditSetup
+                ? "ghost"
+                : "outline"
+          }
+          onClick={() => {
+            const cta = isUnhealthy
+              ? "Fix Setup"
+              : isConfigured
+                ? "Edit Setup"
+                : "Configure";
+            trackButton({
+              CTA: `${cta} - ${name}`,
+              elementId: "provider-card-button",
+              namespace: "settings",
+              payload: { provider: providerKey },
+            });
+            onConfigure(providerKey);
+          }}
+        >
+          {isUnhealthy
+            ? "Fix Setup"
+            : isConfigured
+              ? "Edit Setup"
+              : "Configure"}
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}

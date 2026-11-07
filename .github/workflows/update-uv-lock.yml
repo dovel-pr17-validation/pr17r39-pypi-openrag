@@ -1,0 +1,68 @@
+name: Update uv.lock on version bump
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'pyproject.toml'
+      - 'sdks/python/pyproject.toml'
+      - 'sdks/mcp/pyproject.toml'
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+      - 'sdks/python/pyproject.toml'
+      - 'sdks/mcp/pyproject.toml'
+  workflow_dispatch:
+
+jobs:
+  update-lock:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.head_ref || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Update uv.lock
+        run: uv sync
+
+      - name: Update sdks/python/uv.lock
+        working-directory: sdks/python
+        run: uv sync
+
+      - name: Update sdks/mcp/uv.lock
+        working-directory: sdks/mcp
+        run: uv sync
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet uv.lock sdks/python/uv.lock sdks/mcp/uv.lock; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No changes to uv.lock files"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "uv.lock files have been updated"
+          fi
+
+      - name: Commit and push uv.lock
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add uv.lock sdks/python/uv.lock sdks/mcp/uv.lock
+          git commit -m "chore: update uv.lock files after version bump"
+          git push
+
